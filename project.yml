@@ -37,6 +37,16 @@ targets:
       path: MailMCP/MailMCP.entitlements
     dependencies:
       - target: mailmcp-mcp
+    postBuildScripts:
+      - name: Embed mailmcp-mcp
+        script: |
+          set -euo pipefail
+          SRC="${BUILT_PRODUCTS_DIR}/mailmcp-mcp"
+          DEST="${BUILT_PRODUCTS_DIR}/${PRODUCT_NAME}.app/Contents/MacOS/mailmcp-mcp"
+          if [ -x "${SRC}" ]; then
+            cp -f "${SRC}" "${DEST}"
+            chmod +x "${DEST}"
+          fi
   mailmcp-mcp:
     type: tool
     platform: macOS

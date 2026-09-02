@@ -339,6 +339,7 @@
 			buildPhases = (
 				B3CC3297625E5F9089F26083 /* Sources */,
 				DA01887F197DE1EF5E2FEA00 /* Resources */,
+				255B70D2E859D76D9828BF99 /* Embed mailmcp-mcp */,
 			);
 			buildRules = (
 			);
@@ -409,6 +410,27 @@
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 /* End PBXResourcesBuildPhase section */
+
+/* Begin PBXShellScriptBuildPhase section */
+		255B70D2E859D76D9828BF99 /* Embed mailmcp-mcp */ = {
+			isa = PBXShellScriptBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+			);
+			inputPaths = (
+			);
+			name = "Embed mailmcp-mcp";
+			outputFileListPaths = (
+			);
+			outputPaths = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "set -euo pipefail\nSRC=\"${BUILT_PRODUCTS_DIR}/mailmcp-mcp\"\nDEST=\"${BUILT_PRODUCTS_DIR}/${PRODUCT_NAME}.app/Contents/MacOS/mailmcp-mcp\"\nif [ -x \"${SRC}\" ]; then\n  cp -f \"${SRC}\" \"${DEST}\"\n  chmod +x \"${DEST}\"\nfi\n";
+		};
+/* End PBXShellScriptBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
 		3ABD20C2D3F030F47A77FFAE /* Sources */ = {
