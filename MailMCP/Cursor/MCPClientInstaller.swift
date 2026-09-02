@@ -84,6 +84,12 @@ enum MCPInstallState: Equatable {
 
 enum MCPClientInstaller {
     static func cliURL() -> URL? {
+        if let folder = Bundle.main.executableURL?.deletingLastPathComponent() {
+            let bundled = folder.appendingPathComponent("mailmcp-mcp")
+            if FileManager.default.isExecutableFile(atPath: bundled.path) {
+                return bundled
+            }
+        }
         let sibling = Bundle.main.bundleURL.deletingLastPathComponent().appendingPathComponent("mailmcp-mcp")
         if FileManager.default.isExecutableFile(atPath: sibling.path) {
             return sibling
