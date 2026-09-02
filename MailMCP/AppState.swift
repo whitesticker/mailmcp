@@ -97,6 +97,18 @@ final class AppState: ObservableObject {
         applyUnlockedState()
     }
 
+    func updateAccount(_ account: MailAccount) throws {
+        guard accounts.contains(where: { $0.id == account.id }) else {
+            throw MailMCPError.accountNotFound
+        }
+        try store.mutate { payload in
+            if let index = payload.accounts.firstIndex(where: { $0.id == account.id }) {
+                payload.accounts[index] = account
+            }
+        }
+        applyUnlockedState()
+    }
+
     func addOAuthAccount(provider: MailProviderKind, tokens: OAuthTokens, email: String) throws {
         try store.mutate { payload in
             payload.accounts.removeAll { $0.email.caseInsensitiveCompare(email) == .orderedSame && $0.provider == provider }
@@ -131,6 +143,15 @@ final class AppState: ObservableObject {
             payload.accounts.removeAll { $0.id == id }
         }
         applyUnlockedState()
+    }
+
+    func moveAccounts(fromOffsets: IndexSet, toOffset: Int) throws {
+        var reordered = accounts
+        reordered.move(fromOffsets: fromOffsets, toOffset: toOffset)
+        try store.mutate { payload in
+            payload.accounts = reordered
+        }
+        applyUnlockedState(preserveStatus: true)
     }
 
     func updateSettings(_ body: (inout AppSettings) -> Void) throws {
@@ -265,7 +286,7 @@ final class AppState: ObservableObject {
             return
         }
         isUnlocked = true
-        accounts = payload.accounts.sorted { $0.email.localizedCaseInsensitiveCompare($1.email) == .orderedAscending }
+        accounts = payload.accounts
         settings = payload.settings
         ToolGateStore.save(payload.settings.disabledTools)
         vaultURL = store.vaultURL
