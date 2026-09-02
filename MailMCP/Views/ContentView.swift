@@ -44,22 +44,27 @@ struct ContentView: View {
                     .buttonStyle(.plain)
                     Label("Add to an agent", systemImage: "puzzlepiece.extension")
                         .tag(ContentSelection.agents)
+                    Label("Tool history", systemImage: "clock.arrow.circlepath")
+                        .tag(ContentSelection.history)
                     Label("Settings", systemImage: "gearshape")
                         .tag(ContentSelection.settings)
                 }
                 .scrollDisabled(true)
-                .frame(height: 168)
+                .frame(height: 208)
                 .listStyle(.sidebar)
             }
         } detail: {
             if selected == .agents {
                 AgentsView()
+            } else if selected == .history {
+                ToolHistoryView()
             } else if selected == .settings {
                 SettingsView()
             } else if selected == .pending {
                 PendingSendsView()
             } else if case .account(let id) = selected, let account = appState.account(id: id) {
                 AccountDetailView(account: account)
+                    .id(account.id)
             } else {
                 VStack(spacing: 12) {
                     Image(systemName: "envelope.open")
@@ -88,26 +93,27 @@ struct ContentView: View {
     }
 
     private func mailboxRow(_ account: MailAccount) -> some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Text(account.displayName.isEmpty ? account.email : account.displayName)
-                .font(.headline)
-            Text(account.displayName.isEmpty || account.displayName == account.email
-                 ? account.provider.title
-                 : "\(account.email) · \(account.provider.title)")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-            if let error = account.lastError, !error.isEmpty {
-                Text(error)
-                    .font(.caption2)
-                    .foregroundStyle(.red)
-                    .lineLimit(2)
+        HStack(alignment: .center, spacing: 10) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text(account.displayName.isEmpty ? account.email : account.displayName)
+                    .font(.headline)
+                Text(account.displayName.isEmpty || account.displayName == account.email
+                     ? account.provider.title
+                     : "\(account.email) · \(account.provider.title)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                if let error = account.lastError, !error.isEmpty {
+                    Text(error)
+                        .font(.caption2)
+                        .foregroundStyle(.red)
+                        .lineLimit(2)
+                }
             }
-        }
-        .padding(.trailing, 18)
-        .overlay(alignment: .trailing) {
+            .frame(maxWidth: .infinity, alignment: .leading)
             Image(systemName: "line.3.horizontal")
-                .font(.caption)
+                .font(.body)
                 .foregroundStyle(.tertiary)
+                .frame(width: 16, height: 28, alignment: .center)
         }
         .tag(ContentSelection.account(account.id))
     }
@@ -171,6 +177,12 @@ struct AccountDetailView: View {
         .formStyle(.grouped)
         .navigationTitle(account.displayName.isEmpty ? account.email : account.displayName)
         .padding()
+        .onChange(of: account.id) { _, _ in
+            result = nil
+            busy = false
+            nicknameStatus = nil
+            nickname = account.displayName == account.email ? "" : account.displayName
+        }
         .onChange(of: account.displayName) { _, value in
             nickname = value == account.email ? "" : value
         }
@@ -209,6 +221,7 @@ struct AccountDetailView: View {
 
 enum ContentSelection: Hashable {
     case agents
+    case history
     case settings
     case pending
     case account(UUID)

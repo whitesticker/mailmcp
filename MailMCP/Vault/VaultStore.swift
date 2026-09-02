@@ -34,7 +34,7 @@ final class VaultStore: @unchecked Sendable {
         self.salt = salt
         self.iterations = VaultCrypto.iterations
         self.vaultURL = url
-        KeychainWrap.storeKey(VaultCrypto.keyRawBytes(key), vaultID: payload.vaultID)
+        purgeDeviceKey(vaultID: payload.vaultID)
     }
 
     func unlock(passphrase: String, at url: URL? = nil) throws {
@@ -50,31 +50,7 @@ final class VaultStore: @unchecked Sendable {
         let key = try VaultCrypto.deriveKey(passphrase: passphrase, salt: salt, iterations: envelope.iterations)
         let payload = try VaultFile.unpack(fileData: fileData, key: key)
         adopt(payload: payload, key: key, salt: salt, iterations: envelope.iterations, url: url, hash: FileHash.sha256Hex(fileData))
-        storeDeviceKey()
-    }
-
-    func unlockFromKeychain(expectedID: UUID? = nil, at url: URL? = nil) throws {
-        let url = url ?? vaultURL
-        guard FileManager.default.fileExists(atPath: url.path) else {
-            throw MailMCPError.vaultNotFound
-        }
-        let raw = expectedID.flatMap { KeychainWrap.loadKey(vaultID: $0) }
-            ?? KeychainWrap.loadLegacyKey()
-        guard let raw else {
-            throw MailMCPError.vaultLocked
-        }
-        let key = VaultCrypto.key(from: raw)
-        let fileData = try Data(contentsOf: url)
-        let envelope = try VaultFile.decodeEnvelope(fileData)
-        guard let salt = Data(base64Encoded: envelope.salt) else {
-            throw MailMCPError.crypto("invalid salt")
-        }
-        let payload = try VaultFile.unpack(fileData: fileData, key: key)
-        adopt(payload: payload, key: key, salt: salt, iterations: envelope.iterations, url: url, hash: FileHash.sha256Hex(fileData))
-        storeDeviceKey()
-        if payload.vaultID != VaultPayload.unsignedID {
-            KeychainWrap.migrateLegacyKey(to: payload.vaultID)
-        }
+        purgeDeviceKey()
     }
 
     func lock() {
@@ -143,7 +119,7 @@ final class VaultStore: @unchecked Sendable {
         if changed {
             try write(payload: payload, key: key, salt: salt, iterations: iterations, to: vaultURL)
             self.payload = payload
-            storeDeviceKey()
+            purgeDeviceKey()
         }
     }
 
@@ -159,7 +135,7 @@ final class VaultStore: @unchecked Sendable {
         self.key = key
         self.salt = salt
         self.iterations = VaultCrypto.iterations
-        storeDeviceKey()
+        purgeDeviceKey()
     }
 
     func export(to url: URL) throws {
@@ -187,7 +163,7 @@ final class VaultStore: @unchecked Sendable {
 
     func adoptOpened(payload: VaultPayload, key: SymmetricKey, salt: Data, iterations: UInt32, url: URL, hash: String) {
         adopt(payload: payload, key: key, salt: salt, iterations: iterations, url: url, hash: hash)
-        storeDeviceKey()
+        purgeDeviceKey()
     }
 
     private func adopt(payload: VaultPayload, key: SymmetricKey, salt: Data, iterations: UInt32, url: URL, hash: String) {
@@ -199,9 +175,12 @@ final class VaultStore: @unchecked Sendable {
         self.lastWrittenHash = hash
     }
 
-    private func storeDeviceKey() {
-        guard let key, let vaultID, vaultID != VaultPayload.unsignedID else { return }
-        KeychainWrap.storeKey(VaultCrypto.keyRawBytes(key), vaultID: vaultID)
+    private func purgeDeviceKey(vaultID: UUID? = nil) {
+        let id = vaultID ?? self.vaultID
+        if let id, id != VaultPayload.unsignedID {
+            KeychainWrap.deleteKey(vaultID: id)
+        }
+        KeychainWrap.deleteLegacyKey()
     }
 
     private func write(payload: VaultPayload, key: SymmetricKey, salt: Data, iterations: UInt32, to url: URL) throws {

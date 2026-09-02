@@ -44,7 +44,14 @@ enum KeychainWrap {
     }
 
     static func loadKey(vaultID: UUID) -> Data? {
-        load(account: account(for: vaultID), allowPrompt: true)
+        load(account: account(for: vaultID), allowPrompt: false)
+    }
+
+    static func purgeKnownItems(vaultIDs: [UUID]) {
+        for id in vaultIDs {
+            deleteKey(vaultID: id)
+        }
+        deleteLegacyKey()
     }
 
     @discardableResult
@@ -53,7 +60,7 @@ enum KeychainWrap {
     }
 
     static func loadLegacyKey() -> Data? {
-        load(account: legacyAccount, allowPrompt: true)
+        load(account: legacyAccount, allowPrompt: false)
     }
 
     @discardableResult

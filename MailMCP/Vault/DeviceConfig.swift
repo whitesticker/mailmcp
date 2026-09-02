@@ -28,8 +28,28 @@ struct VaultRegistry: Codable, Sendable {
     var vaults: [VaultDescriptor]
     var activeID: UUID?
     var mcpExposure: MCPExposure
+    var keepRunningOnCommandQ: Bool
 
-    static let empty = VaultRegistry(vaults: [], activeID: nil, mcpExposure: .activeOnly)
+    static let empty = VaultRegistry(vaults: [], activeID: nil, mcpExposure: .activeOnly, keepRunningOnCommandQ: true)
+
+    enum CodingKeys: String, CodingKey {
+        case vaults, activeID, mcpExposure, keepRunningOnCommandQ
+    }
+
+    init(vaults: [VaultDescriptor], activeID: UUID?, mcpExposure: MCPExposure, keepRunningOnCommandQ: Bool = true) {
+        self.vaults = vaults
+        self.activeID = activeID
+        self.mcpExposure = mcpExposure
+        self.keepRunningOnCommandQ = keepRunningOnCommandQ
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        vaults = try container.decode([VaultDescriptor].self, forKey: .vaults)
+        activeID = try container.decodeIfPresent(UUID.self, forKey: .activeID)
+        mcpExposure = try container.decodeIfPresent(MCPExposure.self, forKey: .mcpExposure) ?? .activeOnly
+        keepRunningOnCommandQ = try container.decodeIfPresent(Bool.self, forKey: .keepRunningOnCommandQ) ?? true
+    }
 
     var active: VaultDescriptor? {
         if let activeID, let match = vaults.first(where: { $0.id == activeID }) {
@@ -118,7 +138,7 @@ enum VaultRegistryStore {
             lastSyncAt: nil,
             lastSyncStatus: "Migrated from a single-vault setup."
         )
-        return VaultRegistry(vaults: [descriptor], activeID: id, mcpExposure: .activeOnly)
+        return VaultRegistry(vaults: [descriptor], activeID: id, mcpExposure: .activeOnly, keepRunningOnCommandQ: true)
     }
 
     static func bootstrapFromDefaultFile() -> VaultRegistry {
@@ -136,7 +156,7 @@ enum VaultRegistryStore {
             lastSyncAt: nil,
             lastSyncStatus: ""
         )
-        return VaultRegistry(vaults: [descriptor], activeID: id, mcpExposure: .activeOnly)
+        return VaultRegistry(vaults: [descriptor], activeID: id, mcpExposure: .activeOnly, keepRunningOnCommandQ: true)
     }
 }
 
@@ -167,6 +187,14 @@ enum Paths {
 
     static var pendingSendsURL: URL {
         applicationSupport.appendingPathComponent("pending-sends.json")
+    }
+
+    static var mcpSocket: URL {
+        applicationSupport.appendingPathComponent("mcp.sock")
+    }
+
+    static var pendingIMAPImportURL: URL {
+        applicationSupport.appendingPathComponent("pending-imap-import-path")
     }
 
     static func localVaultURL(id: UUID) -> URL {

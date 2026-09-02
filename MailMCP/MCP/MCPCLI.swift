@@ -4,7 +4,7 @@ import Foundation
 @main
 struct MailMCPCLI {
     static func main() {
-        MCPStdioServer.run()
+        MCPShim.run()
     }
 }
 #endif

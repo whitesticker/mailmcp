@@ -209,6 +209,14 @@ enum MailMCPTools {
             required: ["message_id", "body"]
         ),
         tool(
+            "import_imap_file",
+            "One-time IMAP import from a local text file. Reads email/password pairs from disk; does not send the file anywhere. Skips addresses already in the vault.",
+            [
+                "path": stringProp("Absolute path to a local text file of email + app password pairs.")
+            ],
+            required: ["path"]
+        ),
+        tool(
             "forward_message",
             "Forward a message to someone else. Requires send safety mode.",
             [
@@ -224,9 +232,6 @@ enum MailMCPTools {
     @MainActor
     static func call(name: String, arguments: [String: Any]) async throws -> String {
         let state = AppState.shared
-        if !state.isUnlocked {
-            state.tryKeychainUnlock()
-        }
         guard state.isUnlocked else {
             throw MailMCPError.vaultLocked
         }
@@ -503,6 +508,20 @@ enum MailMCPTools {
             try state.assertSafety(.send, for: account)
             let result = try await state.confirmPendingSend(pending)
             return try encode(["status": "sent", "id": result])
+
+        case "import_imap_file":
+            guard let path = string(arguments["path"])?.trimmingCharacters(in: .whitespacesAndNewlines), !path.isEmpty else {
+                throw MailMCPError.invalidInput("path is required")
+            }
+            let result = try state.importIMAPAccounts(fromFile: URL(fileURLWithPath: path))
+            return try encode([
+                "added": result.added,
+                "replaced": result.replaced,
+                "skipped": result.skipped,
+                "errors": result.errors,
+                "added_count": result.added.count,
+                "skipped_count": result.skipped.count
+            ])
 
         default:
             throw MailMCPError.invalidInput("Unknown tool: \(name)")
