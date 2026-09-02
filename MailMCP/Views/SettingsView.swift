@@ -205,14 +205,11 @@ struct SettingsView: View {
                 SecureField("Confirm new passphrase", text: $confirmPassphrase)
                 FlowLayout {
                     Button("Change passphrase") { changePassphrase() }
-                    Button("Forget Keychain wrap", role: .destructive) {
-                        try? appState.forgetDeviceKey()
-                    }
                 }
             } header: {
                 Text("Passphrase")
             } footer: {
-                Text("Change passphrase re-encrypts this vault. Forget Keychain wrap turns off Touch ID unlock on this Mac; you will type the passphrase instead.")
+                Text("Change passphrase re-encrypts this vault. You type this passphrase to unlock MailMCP; agents do not unlock it.")
             }
         }
         .formStyle(.grouped)
@@ -226,6 +223,12 @@ struct SettingsView: View {
                 Text(vaultStatus(vault))
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                Text(vault.localPath)
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+                    .lineLimit(2)
+                    .truncationMode(.middle)
+                    .textSelection(.enabled)
             }
             Spacer(minLength: 8)
             if vault.id != appState.activeVaultID, appState.unlockedVaults.contains(where: { $0.id == vault.id }) {
@@ -249,6 +252,52 @@ struct SettingsView: View {
 
     private var mcpForm: some View {
         Form {
+            Section("Agent connection") {
+                if appState.mcpAgents.isEmpty {
+                    LabeledContent("Status", value: appState.mcpConnectionSummary)
+                } else {
+                    ForEach(appState.mcpAgents) { agent in
+                        LabeledContent(agent.displayName) {
+                            VStack(alignment: .trailing, spacing: 2) {
+                                Text("Connected")
+                                Text(agent.connectedAt.formatted(date: .omitted, time: .shortened))
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                if !agent.version.isEmpty {
+                                    Text(agent.version)
+                                        .font(.caption2)
+                                        .foregroundStyle(.tertiary)
+                                }
+                            }
+                        }
+                    }
+                    if let lastMCPActivity = appState.lastMCPActivity {
+                        LabeledContent(
+                            "Last tool call",
+                            value: lastMCPActivity.formatted(date: .omitted, time: .shortened)
+                        )
+                    }
+                }
+                if appState.isUnlocked && appState.mcpAgents.isEmpty {
+                    Text("This window can read mail. Cursor is not attached to this app. Restart the MailMCP MCP in Cursor after MailMCP is open.")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                } else if !appState.isUnlocked {
+                    Text("Unlock the vault in this window. The helper Cursor launches only forwards to this app.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                } else {
+                    Text("Agents are talking to this running app. Quit MailMCP from the menu bar to disconnect them.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            Section("Quit") {
+                Toggle("Command-Q keeps MailMCP in the menu bar", isOn: keepRunningBinding)
+                Text("On by default so Command-Q does not kill agents. Use Quit in the menu bar icon to shut MailMCP down.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
             Section("Agent visibility") {
                 Picker("Mailboxes agents can use", selection: mcpExposureBinding) {
                     ForEach(MCPExposure.allCases) { value in
@@ -335,6 +384,13 @@ struct SettingsView: View {
         Binding(
             get: { appState.mcpExposure },
             set: { appState.setMCPExposure($0) }
+        )
+    }
+
+    private var keepRunningBinding: Binding<Bool> {
+        Binding(
+            get: { appState.keepRunningOnCommandQ },
+            set: { appState.keepRunningOnCommandQ = $0 }
         )
     }
 
@@ -449,7 +505,7 @@ struct AgentsView: View {
     var body: some View {
         Form {
             Section {
-                Text("Each agent keeps MCP servers in its own file on this Mac. MailMCP writes that file; the agent reloads it on next launch or MCP refresh. Nothing is stored in the cloud.")
+                Text("Each agent launches a small helper that connects to this running MailMCP app. Unlock MailMCP first, then add the agent. If the window works but the agent does not, restart MailMCP in the agent.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }

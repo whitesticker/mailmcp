@@ -98,6 +98,15 @@ final class VaultTests: XCTestCase {
         XCTAssertEqual(registry.vaults[0].lastSyncedHash, "abc")
         XCTAssertEqual(registry.activeID, registry.vaults[0].id)
         XCTAssertEqual(registry.mcpExposure, .activeOnly)
+        XCTAssertTrue(registry.keepRunningOnCommandQ)
+    }
+
+    func testRegistryDefaultsCommandQKeepRunning() throws {
+        let json = """
+        {"vaults":[],"mcpExposure":"activeOnly"}
+        """
+        let registry = try JSONCoders.decoder.decode(VaultRegistry.self, from: Data(json.utf8))
+        XCTAssertTrue(registry.keepRunningOnCommandQ)
     }
 
     func testKeychainWrapIsScopedByVaultID() {
@@ -212,6 +221,33 @@ final class VaultTests: XCTestCase {
         try VaultFile.pack(payload: VaultPayload.empty(name: "Remote2"), key: key, salt: salt, iterations: 100_000).write(to: replica)
         let conflict = try VaultSync.reconcile(localURL: local, replicaURL: replica, lastSyncedHash: pulled.localHash)
         XCTAssertEqual(conflict.outcome, .conflict)
+    }
+
+    func testMCPCallLogRedactsSecretsAndMapsAgentNames() {
+        XCTAssertEqual(MCPCallLog.displayName(clientName: "cursor-vscode"), "Cursor")
+        XCTAssertEqual(MCPCallLog.displayName(clientName: ""), "Unknown agent")
+        let json = MCPCallLog.prettyJSON([
+            "query": "invoices",
+            "password": "should-not-appear",
+            "limit": 10
+        ])
+        XCTAssertTrue(json.contains("invoices"))
+        XCTAssertTrue(json.contains("••••"))
+        XCTAssertFalse(json.contains("should-not-appear"))
+    }
+
+    func testIMAPImporterParsesEmailThenAppPasswordBlocks() {
+        let text = """
+        already@gmail.com
+        aaaa bbbb cccc dddd
+
+        --------------------------------
+        new.one@gmail.com
+        eeee ffff gggg hhhh
+        """
+        let drafts = IMAPAccountImporter.parse(text)
+        XCTAssertEqual(drafts.map(\.email), ["already@gmail.com", "new.one@gmail.com"])
+        XCTAssertEqual(drafts.map(\.password), ["aaaa bbbb cccc dddd", "eeee ffff gggg hhhh"])
     }
 
     private func sampleIMAP(password: String) -> IMAPSettings {

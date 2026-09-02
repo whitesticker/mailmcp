@@ -29,4 +29,4 @@ xcodebuild -project MailMCP.xcodeproj -scheme MailMCP -configuration Release \
 open .derived/Build/Products/Release/MailMCP.app
 ```
 
-Agents should launch `mailmcp-mcp` (inside the app bundle), not the `MailMCP` GUI binary.
+Agents should launch `mailmcp-mcp` (inside the app bundle). That helper forwards to the running MailMCP app; quit the app and the agent disconnects.

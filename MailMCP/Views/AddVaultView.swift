@@ -8,6 +8,7 @@ struct AddVaultView: View {
     @State private var passphrase = ""
     @State private var confirm = ""
     @State private var openPassphrase = ""
+    @State private var pickedURL: URL?
     @State private var showImporter = false
     @State private var error: String?
 
@@ -34,11 +35,25 @@ struct AddVaultView: View {
 
             GroupBox("Open an existing vault") {
                 VStack(alignment: .leading, spacing: 10) {
-                    SecureField("Passphrase for the file", text: $openPassphrase)
-                    FlowLayout {
-                        Button("Open vault…") { showImporter = true }
+                    if let pickedURL {
+                        Text(pickedURL.path)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .textSelection(.enabled)
+                            .lineLimit(3)
+                            .truncationMode(.middle)
+                        SecureField("Passphrase for the file", text: $openPassphrase)
+                        FlowLayout {
+                            Button("Open vault") { open(pickedURL) }
+                                .keyboardShortcut(.defaultAction)
+                            Button("Choose a different file…") { showImporter = true }
+                        }
+                    } else {
+                        FlowLayout {
+                            Button("Choose vault…") { showImporter = true }
+                        }
                     }
-                    Text("Copies a portable .vault onto this Mac, unlocks it, and makes it active. The original file is not changed.")
+                    Text("Pick the file first, then enter its passphrase. MailMCP opens that file in place and does not make another copy.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -59,7 +74,8 @@ struct AddVaultView: View {
         .fileImporter(isPresented: $showImporter, allowedContentTypes: [.item]) { result in
             switch result {
             case .success(let url):
-                open(url)
+                pickedURL = url
+                error = nil
             case .failure(let failure):
                 error = failure.localizedDescription
             }

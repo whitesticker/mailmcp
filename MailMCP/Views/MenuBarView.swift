@@ -9,8 +9,15 @@ struct MenuBarView: View {
         VStack(alignment: .leading, spacing: 8) {
             Text(appState.isUnlocked ? "Vault unlocked" : "Vault locked")
                 .font(.headline)
+            Text(appState.mcpConnectionSummary)
+                .foregroundStyle(appState.isUnlocked && appState.mcpAgentCount == 0 ? .orange : .secondary)
             Text("\(appState.accounts.count) mailbox\(appState.accounts.count == 1 ? "" : "es")")
                 .foregroundStyle(.secondary)
+            if appState.parkedInMenuBarNotice {
+                Text("Command-Q closed the window. Quit here to disconnect agents.")
+                    .foregroundStyle(.secondary)
+                    .font(.caption)
+            }
             if !appState.pendingSends.isEmpty {
                 Text("\(appState.pendingSends.count) send(s) waiting for confirmation")
                     .foregroundStyle(.orange)
@@ -36,7 +43,7 @@ struct MenuBarView: View {
                 openWindow(id: "main")
             }
             Button("Quit") {
-                NSApp.terminate(nil)
+                appState.requestMenuBarQuit()
             }
         }
         .padding(8)

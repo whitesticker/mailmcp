@@ -30,6 +30,7 @@ enum MCPToolCatalog {
         MCPToolInfo(name: "get_attachment", title: "Get attachment", intro: "Downloads one attachment as base64.", audience: .readOnly),
         MCPToolInfo(name: "list_pending_sends", title: "List pending sends", intro: "Outbound mail waiting for your confirmation.", audience: .readOnly),
 
+        MCPToolInfo(name: "import_imap_file", title: "Import IMAP file", intro: "Adds IMAP mailboxes from a local email/password text file. Skips addresses already in the vault.", audience: .mailboxAdd),
         MCPToolInfo(name: "create_draft", title: "Create draft", intro: "Writes a draft. Does not send.", audience: .mailboxAdd),
         MCPToolInfo(name: "snooze_message", title: "Snooze message", intro: "Hides a message from the digest until a time you choose. Local to MailMCP.", audience: .mailboxAdd),
 

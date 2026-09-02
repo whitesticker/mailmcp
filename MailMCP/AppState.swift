@@ -35,10 +35,17 @@ final class AppState: ObservableObject {
     @Published var registry = VaultRegistry.empty
     @Published var pendingMerge: VaultMergeSession?
     @Published var lastSyncStatus: String = ""
+    @Published var mcpAgents: [MCPAgentConnection] = []
+    @Published var mcpToolHistory: [MCPToolCallRecord] = []
+    @Published var lastMCPActivity: Date?
+    @Published var parkedInMenuBarNotice = false
+
+    var mcpAgentCount: Int { mcpAgents.count }
+
+    var isTerminatingFromMenuBar = false
 
     private var stores: [UUID: VaultStore] = [:]
     private var watchers: [UUID: VaultSyncWatcher] = [:]
-    private var didAttemptKeychainUnlock = false
     private var syncDebounce: Task<Void, Never>?
 
     var vaultExists: Bool {
@@ -86,28 +93,75 @@ final class AppState: ObservableObject {
         registry = VaultRegistryStore.load()
         vaultURL = registry.active?.localURL ?? Paths.defaultVaultURL
         pendingSends = PendingSendStore.load()
-        if ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil {
-            return
-        }
-        if vaultExists {
-            tryKeychainUnlock()
+    }
+
+    var keepRunningOnCommandQ: Bool {
+        get { registry.keepRunningOnCommandQ }
+        set {
+            registry.keepRunningOnCommandQ = newValue
+            persistRegistry()
+            objectWillChange.send()
         }
     }
 
-    func tryKeychainUnlock() {
-        guard !didAttemptKeychainUnlock else { return }
-        didAttemptKeychainUnlock = true
-        guard let descriptor = registry.active ?? registry.vaults.first else { return }
-        do {
-            try unlockDescriptor(descriptor, fromKeychain: true)
-        } catch {
-            isUnlocked = false
+    var mcpConnectionSummary: String {
+        if mcpAgentCount == 0 {
+            return isUnlocked
+                ? "No agent connected"
+                : "Unlock to serve agents"
+        }
+        let agents = mcpAgentCount == 1 ? "1 agent connected" : "\(mcpAgentCount) agents connected"
+        if !isUnlocked {
+            return "\(agents) · vault locked"
+        }
+        if let lastMCPActivity {
+            return "\(agents) · last call \(lastMCPActivity.formatted(date: .omitted, time: .shortened))"
+        }
+        return agents
+    }
+
+    func mcpAgentDidConnect(id: UUID) {
+        mcpAgents.append(MCPAgentConnection(id: id, name: "", version: "", connectedAt: Date()))
+    }
+
+    func mcpAgentDidIdentify(id: UUID, name: String, version: String) {
+        guard let index = mcpAgents.firstIndex(where: { $0.id == id }) else { return }
+        mcpAgents[index].name = name
+        mcpAgents[index].version = version
+    }
+
+    func mcpAgentDidDisconnect(id: UUID) {
+        mcpAgents.removeAll { $0.id == id }
+    }
+
+    func recordMCPToolCall(agentName: String, tool: String, arguments: [String: Any], succeeded: Bool) {
+        lastMCPActivity = Date()
+        let record = MCPToolCallRecord(
+            id: UUID(),
+            date: Date(),
+            agentName: MCPCallLog.displayName(clientName: agentName),
+            tool: tool,
+            argumentsJSON: MCPCallLog.prettyJSON(arguments),
+            succeeded: succeeded
+        )
+        mcpToolHistory.insert(record, at: 0)
+        if mcpToolHistory.count > MCPCallLog.historyLimit {
+            mcpToolHistory.removeLast(mcpToolHistory.count - MCPCallLog.historyLimit)
         }
     }
 
-    func retryKeychainUnlock() {
-        didAttemptKeychainUnlock = false
-        tryKeychainUnlock()
+    func clearMCPToolHistory() {
+        mcpToolHistory.removeAll()
+    }
+
+    func noteCommandQParked() {
+        parkedInMenuBarNotice = true
+        statusMessage = "MailMCP is still running in the menu bar. Quit from there to disconnect agents."
+    }
+
+    func requestMenuBarQuit() {
+        isTerminatingFromMenuBar = true
+        NSApp.terminate(nil)
     }
 
     func createVault(passphrase: String, name: String = "Personal") throws {
@@ -148,45 +202,38 @@ final class AppState: ObservableObject {
     }
 
     func importVault(from url: URL, passphrase: String) throws {
-        if let existing = registry.vaults.first(where: { $0.localPath == url.path }) {
+        let fileURL = url.standardizedFileURL
+        if let existing = registry.vaults.first(where: {
+            URL(fileURLWithPath: $0.localPath).standardizedFileURL == fileURL
+        }) {
             try unlockDescriptor(existing, passphrase: passphrase)
             return
         }
-        let data = try Data(contentsOf: url)
-        let envelope = try VaultFile.decodeEnvelope(data)
-        guard let salt = Data(base64Encoded: envelope.salt) else {
-            throw MailMCPError.crypto("invalid salt")
-        }
-        let key = try VaultCrypto.deriveKey(passphrase: passphrase, salt: salt, iterations: envelope.iterations)
-        var payload = try VaultFile.unpack(fileData: data, key: key)
-        if payload.vaultID == VaultPayload.unsignedID {
-            payload.vaultID = UUID()
-        }
-        let dest = Paths.localVaultURL(id: payload.vaultID)
-        let store = VaultStore(vaultURL: dest)
-        if FileManager.default.fileExists(atPath: dest.path), dest.standardizedFileURL != url.standardizedFileURL {
-            try store.unlock(passphrase: passphrase, at: dest)
-        } else {
-            try FileManager.default.createDirectory(at: dest.deletingLastPathComponent(), withIntermediateDirectories: true)
-            if dest.standardizedFileURL != url.standardizedFileURL {
-                try VaultSync.copyAtomically(from: url, to: dest)
-            }
-            try store.unlock(passphrase: passphrase, at: dest)
-        }
-        try store.ensureIdentity(defaultID: payload.vaultID, defaultName: payload.name)
-        let id = store.payload?.vaultID ?? payload.vaultID
+
+        let store = VaultStore(vaultURL: fileURL)
+        try store.unlock(passphrase: passphrase, at: fileURL)
+        try store.ensureIdentity(defaultID: store.payload?.vaultID ?? UUID(), defaultName: store.payload?.name ?? "Personal")
+        let id = store.payload?.vaultID ?? UUID()
         stores[id] = store
-        registry.upsert(
-            VaultDescriptor(
-                id: id,
-                name: store.payload?.name ?? payload.name,
-                localPath: dest.path,
-                syncPath: nil,
-                lastSyncedHash: store.lastWrittenHash,
-                lastSyncAt: nil,
-                lastSyncStatus: ""
+
+        if var existing = registry.descriptor(id: id) {
+            existing.localPath = fileURL.path
+            existing.name = store.payload?.name ?? existing.name
+            existing.lastSyncedHash = store.lastWrittenHash
+            registry.upsert(existing)
+        } else {
+            registry.upsert(
+                VaultDescriptor(
+                    id: id,
+                    name: store.payload?.name ?? "Personal",
+                    localPath: fileURL.path,
+                    syncPath: nil,
+                    lastSyncedHash: store.lastWrittenHash,
+                    lastSyncAt: nil,
+                    lastSyncStatus: ""
+                )
             )
-        )
+        }
         registry.activeID = id
         persistRegistry()
         applyUnlockedState()
@@ -298,6 +345,52 @@ final class AppState: ObservableObject {
             payload.accounts.append(account)
         }
         applyUnlockedState()
+    }
+
+    @discardableResult
+    func importIMAPAccounts(fromFile url: URL, replaceExisting: Bool = false) throws -> IMAPImportResult {
+        let text = try String(contentsOf: url, encoding: .utf8)
+        return try importIMAPAccounts(from: text, replaceExisting: replaceExisting)
+    }
+
+    @discardableResult
+    func importIMAPAccounts(from text: String, replaceExisting: Bool = false) throws -> IMAPImportResult {
+        let drafts = IMAPAccountImporter.parse(text)
+        guard !drafts.isEmpty else {
+            throw MailMCPError.invalidInput("No email/password pairs found in the import file.")
+        }
+        var result = IMAPImportResult(added: [], replaced: [], skipped: [], errors: [])
+        try mutateActive { payload in
+            let existing = Set(
+                payload.accounts
+                    .filter { $0.provider == .imap }
+                    .map { $0.email.lowercased() }
+            )
+            for draft in drafts {
+                do {
+                    let account = try IMAPAccountImporter.account(from: draft)
+                    let email = account.email.lowercased()
+                    if existing.contains(email), !replaceExisting {
+                        result.skipped.append(account.email)
+                        continue
+                    }
+                    payload.accounts.removeAll {
+                        $0.email.caseInsensitiveCompare(account.email) == .orderedSame && $0.provider == .imap
+                    }
+                    payload.accounts.append(account)
+                    if existing.contains(email) {
+                        result.replaced.append(account.email)
+                    } else {
+                        result.added.append(account.email)
+                    }
+                } catch {
+                    result.errors.append("\(draft.email): \(error.localizedDescription)")
+                }
+            }
+        }
+        applyUnlockedState(preserveStatus: true)
+        statusMessage = "Imported \(result.added.count) mailbox(es). Skipped \(result.skipped.count) already in the vault."
+        return result
     }
 
     func updateAccount(_ account: MailAccount) throws {
@@ -638,15 +731,9 @@ final class AppState: ObservableObject {
         ToolGateStore.save(settings.disabledTools)
     }
 
-    private func unlockDescriptor(_ descriptor: VaultDescriptor, passphrase: String? = nil, fromKeychain: Bool = false) throws {
+    private func unlockDescriptor(_ descriptor: VaultDescriptor, passphrase: String) throws {
         let store = stores[descriptor.id] ?? VaultStore(vaultURL: descriptor.localURL)
-        if fromKeychain {
-            try store.unlockFromKeychain(expectedID: descriptor.id, at: descriptor.localURL)
-        } else if let passphrase {
-            try store.unlock(passphrase: passphrase, at: descriptor.localURL)
-        } else {
-            throw MailMCPError.vaultLocked
-        }
+        try store.unlock(passphrase: passphrase, at: descriptor.localURL)
         try store.ensureIdentity(defaultID: descriptor.id, defaultName: descriptor.name)
         var updated = descriptor
         if let payload = store.payload {
@@ -730,6 +817,21 @@ final class AppState: ObservableObject {
             statusMessage = "Unlocked — \(accounts.count) account\(accounts.count == 1 ? "" : "s")"
         }
         startWatchers()
+        consumePendingIMAPImportIfNeeded()
+    }
+
+    private var isConsumingIMAPImport = false
+
+    private func consumePendingIMAPImportIfNeeded() {
+        guard !isConsumingIMAPImport, isUnlocked else { return }
+        let marker = Paths.pendingIMAPImportURL
+        guard let raw = try? String(contentsOf: marker, encoding: .utf8) else { return }
+        let path = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        try? FileManager.default.removeItem(at: marker)
+        guard !path.isEmpty else { return }
+        isConsumingIMAPImport = true
+        defer { isConsumingIMAPImport = false }
+        _ = try? importIMAPAccounts(fromFile: URL(fileURLWithPath: path))
     }
 
     private func publishAccounts() {

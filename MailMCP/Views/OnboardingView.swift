@@ -7,6 +7,7 @@ struct OnboardingView: View {
     @State private var confirm = ""
     @State private var vaultName = "Personal"
     @State private var importPassphrase = ""
+    @State private var importURL: URL?
     @State private var showImporter = false
     @State private var localError: String?
     @State private var unlockTarget: UUID?
@@ -31,15 +32,17 @@ struct OnboardingView: View {
                             .foregroundStyle(unlockTarget == vault.id || (unlockTarget == nil && vault.id == appState.registry.activeID)
                                              ? Color.accentColor : Color.primary)
                         }
+                        if let selected = selectedUnlockVault {
+                            Text(selected.localPath)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .textSelection(.enabled)
+                                .lineLimit(3)
+                                .truncationMode(.middle)
+                        }
                         SecureField("Vault passphrase", text: $passphrase)
                         Button("Unlock") { unlock() }
                             .keyboardShortcut(.defaultAction)
-                        Button(KeychainWrap.presenceButtonTitle) {
-                            appState.retryKeychainUnlock()
-                            if !appState.isUnlocked {
-                                localError = "Touch ID was cancelled or failed. Enter your passphrase."
-                            }
-                        }
                     }
                     .padding(8)
                 }
@@ -49,12 +52,6 @@ struct OnboardingView: View {
                         SecureField("Vault passphrase", text: $passphrase)
                         Button("Unlock") { unlock() }
                             .keyboardShortcut(.defaultAction)
-                        Button(KeychainWrap.presenceButtonTitle) {
-                            appState.retryKeychainUnlock()
-                            if !appState.isUnlocked {
-                                localError = "Touch ID was cancelled or failed. Enter your passphrase."
-                            }
-                        }
                     }
                     .padding(8)
                 }
@@ -66,7 +63,7 @@ struct OnboardingView: View {
                         TextField("Vault name", text: $vaultName)
                         SecureField("Choose a passphrase", text: $passphrase)
                         SecureField("Confirm passphrase", text: $confirm)
-                        Text("This passphrase encrypts the portable vault file. You will type it on each new Mac. On this Mac, MailMCP can then unlock with Touch ID or your Mac password.")
+                        Text("This passphrase encrypts the portable vault file. Type it whenever you open MailMCP. Agents use this running app; quitting MailMCP disconnects them.")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                         Button("Create vault") { create() }
@@ -78,8 +75,20 @@ struct OnboardingView: View {
 
             GroupBox("Or open a portable vault") {
                 VStack(alignment: .leading, spacing: 12) {
-                    SecureField("Passphrase for the imported file", text: $importPassphrase)
-                    Button("Import MailMCP.vault…") { showImporter = true }
+                    if let importURL {
+                        Text(importURL.path)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .textSelection(.enabled)
+                            .lineLimit(3)
+                            .truncationMode(.middle)
+                        SecureField("Passphrase for the imported file", text: $importPassphrase)
+                        Button("Import vault") { importVault(importURL) }
+                        Button("Choose a different file…") { showImporter = true }
+                            .buttonStyle(.plain)
+                    } else {
+                        Button("Choose MailMCP.vault…") { showImporter = true }
+                    }
                 }
                 .padding(8)
             }
@@ -93,7 +102,8 @@ struct OnboardingView: View {
         .fileImporter(isPresented: $showImporter, allowedContentTypes: [.item]) { result in
             switch result {
             case .success(let url):
-                importVault(url)
+                importURL = url
+                localError = nil
             case .failure(let error):
                 localError = error.localizedDescription
             }
@@ -101,6 +111,13 @@ struct OnboardingView: View {
         .onAppear {
             unlockTarget = appState.registry.activeID ?? appState.registry.vaults.first?.id
         }
+    }
+
+    private var selectedUnlockVault: VaultDescriptor? {
+        if let unlockTarget {
+            return appState.registry.descriptor(id: unlockTarget)
+        }
+        return appState.registry.active
     }
 
     private func create() {
