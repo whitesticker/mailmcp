@@ -4,6 +4,7 @@ struct ContentView: View {
     @EnvironmentObject private var appState: AppState
     @State private var selected: ContentSelection?
     @State private var showAddAccount = false
+    @State private var showAddVault = false
 
     var body: some View {
         NavigationSplitView {
@@ -15,56 +16,40 @@ struct ContentView: View {
                                 .tag(ContentSelection.pending)
                         }
                     }
-                    Section("Mailboxes") {
-                        ForEach(appState.accounts) { account in
-                            VStack(alignment: .leading, spacing: 4) {
-                                Text(account.displayName.isEmpty ? account.email : account.displayName)
-                                    .font(.headline)
-                                Text(account.displayName.isEmpty || account.displayName == account.email
-                                     ? account.provider.title
-                                     : "\(account.email) · \(account.provider.title)")
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                                if let error = account.lastError, !error.isEmpty {
-                                    Text(error)
-                                        .font(.caption2)
-                                        .foregroundStyle(.red)
-                                        .lineLimit(2)
-                                }
+                    ForEach(appState.unlockedVaults) { vault in
+                        Section(vault.name) {
+                            ForEach(vault.accounts) { account in
+                                mailboxRow(account)
                             }
-                            .padding(.trailing, 18)
-                            .overlay(alignment: .trailing) {
-                                Image(systemName: "line.3.horizontal")
-                                    .font(.caption)
-                                    .foregroundStyle(.tertiary)
+                            .onMove { offsets, destination in
+                                try? appState.moveAccounts(in: vault.id, fromOffsets: offsets, toOffset: destination)
                             }
-                            .tag(ContentSelection.account(account.id))
-                        }
-                        .onMove { offsets, destination in
-                            try? appState.moveAccounts(fromOffsets: offsets, toOffset: destination)
                         }
                     }
                 }
                 .navigationTitle("Mailboxes")
                 Divider()
                 List(selection: $selected) {
+                    Button {
+                        showAddAccount = true
+                    } label: {
+                        Label("Add an Account", systemImage: "envelope.badge.plus")
+                    }
+                    .buttonStyle(.plain)
+                    Button {
+                        showAddVault = true
+                    } label: {
+                        Label("Add vault", systemImage: "externaldrive.badge.plus")
+                    }
+                    .buttonStyle(.plain)
                     Label("Add to an agent", systemImage: "puzzlepiece.extension")
                         .tag(ContentSelection.agents)
                     Label("Settings", systemImage: "gearshape")
                         .tag(ContentSelection.settings)
                 }
                 .scrollDisabled(true)
-                .frame(height: 96)
+                .frame(height: 168)
                 .listStyle(.sidebar)
-            }
-            .toolbar {
-                ToolbarItem {
-                    Button {
-                        showAddAccount = true
-                    } label: {
-                        Label("Add account", systemImage: "plus")
-                    }
-                }
             }
         } detail: {
             if selected == .agents {
@@ -73,14 +58,14 @@ struct ContentView: View {
                 SettingsView()
             } else if selected == .pending {
                 PendingSendsView()
-            } else if case .account(let id) = selected, let account = appState.accounts.first(where: { $0.id == id }) {
+            } else if case .account(let id) = selected, let account = appState.account(id: id) {
                 AccountDetailView(account: account)
             } else {
                 VStack(spacing: 12) {
                     Image(systemName: "envelope.open")
                         .font(.system(size: 36))
                         .foregroundStyle(.secondary)
-                    Text(appState.accounts.isEmpty ? "Add a mailbox to get started." : "Select a mailbox.")
+                    Text(appState.unlockedVaults.flatMap(\.accounts).isEmpty ? "Add a mailbox to get started." : "Select a mailbox.")
                         .foregroundStyle(.secondary)
                     if let status = appState.statusMessage {
                         Text(status)
@@ -96,6 +81,35 @@ struct ContentView: View {
                 .environmentObject(appState)
                 .frame(minWidth: 520, minHeight: 420)
         }
+        .sheet(isPresented: $showAddVault) {
+            AddVaultView()
+                .environmentObject(appState)
+        }
+    }
+
+    private func mailboxRow(_ account: MailAccount) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(account.displayName.isEmpty ? account.email : account.displayName)
+                .font(.headline)
+            Text(account.displayName.isEmpty || account.displayName == account.email
+                 ? account.provider.title
+                 : "\(account.email) · \(account.provider.title)")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            if let error = account.lastError, !error.isEmpty {
+                Text(error)
+                    .font(.caption2)
+                    .foregroundStyle(.red)
+                    .lineLimit(2)
+            }
+        }
+        .padding(.trailing, 18)
+        .overlay(alignment: .trailing) {
+            Image(systemName: "line.3.horizontal")
+                .font(.caption)
+                .foregroundStyle(.tertiary)
+        }
+        .tag(ContentSelection.account(account.id))
     }
 }
 

@@ -17,7 +17,7 @@ struct MCPToolInfo: Identifiable, Hashable, Sendable {
 
 enum MCPToolCatalog {
     static let all: [MCPToolInfo] = [
-        MCPToolInfo(name: "list_accounts", title: "List accounts", intro: "Shows which mailboxes are in the unlocked vault.", audience: .readOnly),
+        MCPToolInfo(name: "list_accounts", title: "List accounts", intro: "Shows mailboxes in the active vault, or all unlocked vaults if that setting is on.", audience: .readOnly),
         MCPToolInfo(name: "search_messages", title: "Search messages", intro: "Finds messages by text or from:/to:/subject:.", audience: .readOnly),
         MCPToolInfo(name: "get_message", title: "Get message", intro: "Reads one message body, headers, and attachment names.", audience: .readOnly),
         MCPToolInfo(name: "get_thread", title: "Get thread", intro: "Reads a conversation in date order.", audience: .readOnly),

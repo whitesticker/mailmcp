@@ -12,7 +12,7 @@ enum MailMCPTools {
     private static let catalog: [[String: Any]] = [
         tool(
             "list_accounts",
-            "List mailboxes stored in the unlocked MailMCP vault.",
+            "List mailboxes in the active vault, or all unlocked vaults if that setting is on. Each row includes vault_id and vault_name.",
             [:]
         ),
         tool(
@@ -242,7 +242,9 @@ enum MailMCPTools {
                     "email": $0.email,
                     "provider": $0.provider.rawValue,
                     "display_name": $0.displayName,
-                    "last_error": $0.lastError ?? ""
+                    "last_error": $0.lastError ?? "",
+                    "vault_id": state.vaultID(for: $0)?.uuidString ?? "",
+                    "vault_name": state.vaultName(for: $0)
                 ]
             }
             return try encode(rows)
@@ -283,8 +285,8 @@ enum MailMCPTools {
             return try encode(result)
 
         case "modify_message":
-            try state.assertSafety(.drafts)
             let account = try state.resolveAccount(idOrEmail: string(arguments["account_id"]))
+            try state.assertSafety(.drafts, for: account)
             let mail = try state.provider(for: account)
             guard let id = string(arguments["message_id"]) else {
                 throw MailMCPError.invalidInput("message_id is required")
@@ -296,8 +298,8 @@ enum MailMCPTools {
             return try encode(["status": "ok", "action": actionRaw, "message_id": id])
 
         case "create_draft":
-            try state.assertSafety(.drafts)
             let account = try state.resolveAccount(idOrEmail: string(arguments["account_id"]))
+            try state.assertSafety(.drafts, for: account)
             let mail = try state.provider(for: account)
             let id = try await mail.createDraft(
                 to: strings(arguments["to"]),
@@ -309,8 +311,8 @@ enum MailMCPTools {
             return try encode(["status": "drafted", "id": id])
 
         case "send_message":
-            try state.assertSafety(.send)
             let account = try state.resolveAccount(idOrEmail: string(arguments["account_id"]))
+            try state.assertSafety(.send, for: account)
             return try await enqueueOrSend(
                 state: state,
                 account: account,
@@ -391,8 +393,8 @@ enum MailMCPTools {
             return try encode(try await mail.listDrafts(limit: int(arguments["limit"]) ?? 20))
 
         case "update_draft":
-            try state.assertSafety(.drafts)
             let account = try state.resolveAccount(idOrEmail: string(arguments["account_id"]))
+            try state.assertSafety(.drafts, for: account)
             let mail = try state.provider(for: account)
             guard let draftID = string(arguments["draft_id"]) else {
                 throw MailMCPError.invalidInput("draft_id is required")
@@ -408,8 +410,8 @@ enum MailMCPTools {
             return try encode(["status": "updated", "id": id])
 
         case "delete_draft":
-            try state.assertSafety(.drafts)
             let account = try state.resolveAccount(idOrEmail: string(arguments["account_id"]))
+            try state.assertSafety(.drafts, for: account)
             let mail = try state.provider(for: account)
             guard let draftID = string(arguments["draft_id"]) else {
                 throw MailMCPError.invalidInput("draft_id is required")
@@ -418,8 +420,8 @@ enum MailMCPTools {
             return try encode(["status": "deleted", "id": draftID])
 
         case "file_message":
-            try state.assertSafety(.drafts)
             let account = try state.resolveAccount(idOrEmail: string(arguments["account_id"]))
+            try state.assertSafety(.drafts, for: account)
             let mail = try state.provider(for: account)
             guard let id = string(arguments["message_id"]) else {
                 throw MailMCPError.invalidInput("message_id is required")
@@ -433,8 +435,8 @@ enum MailMCPTools {
             return try encode(["status": "filed", "message_id": id])
 
         case "snooze_message":
-            try state.assertSafety(.drafts)
             let account = try state.resolveAccount(idOrEmail: string(arguments["account_id"]))
+            try state.assertSafety(.drafts, for: account)
             guard let id = string(arguments["message_id"]) else {
                 throw MailMCPError.invalidInput("message_id is required")
             }
@@ -448,8 +450,8 @@ enum MailMCPTools {
             return try encode(["status": "snoozed", "message_id": id, "until": ISO8601DateFormatter().string(from: until)])
 
         case "reply_message":
-            try state.assertSafety(.send)
             let account = try state.resolveAccount(idOrEmail: string(arguments["account_id"]))
+            try state.assertSafety(.send, for: account)
             let mail = try state.provider(for: account)
             guard let id = string(arguments["message_id"]) else {
                 throw MailMCPError.invalidInput("message_id is required")
@@ -469,8 +471,8 @@ enum MailMCPTools {
             )
 
         case "forward_message":
-            try state.assertSafety(.send)
             let account = try state.resolveAccount(idOrEmail: string(arguments["account_id"]))
+            try state.assertSafety(.send, for: account)
             let mail = try state.provider(for: account)
             guard let id = string(arguments["message_id"]) else {
                 throw MailMCPError.invalidInput("message_id is required")
@@ -491,13 +493,14 @@ enum MailMCPTools {
             )
 
         case "confirm_send":
-            try state.assertSafety(.send)
             guard let raw = string(arguments["pending_id"]), let id = UUID(uuidString: raw) else {
                 throw MailMCPError.invalidInput("pending_id must be a UUID")
             }
             guard let pending = state.pendingSends.first(where: { $0.id == id }) else {
                 throw MailMCPError.invalidInput("No pending send with that id")
             }
+            let account = try state.resolveAccount(idOrEmail: pending.accountID.uuidString)
+            try state.assertSafety(.send, for: account)
             let result = try await state.confirmPendingSend(pending)
             return try encode(["status": "sent", "id": result])
 
@@ -616,7 +619,7 @@ enum MailMCPTools {
             body: body,
             extraHeaders: extraHeaders
         )
-        if state.settings.confirmBeforeSend {
+        if state.settings(for: account).confirmBeforeSend {
             state.enqueueSend(pending)
             return try encode([
                 "status": "pending_confirmation",

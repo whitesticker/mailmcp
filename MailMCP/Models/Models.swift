@@ -173,13 +173,57 @@ struct AppSettings: Codable, Hashable, Sendable {
 }
 
 struct VaultPayload: Codable, Hashable, Sendable {
+    static let unsignedID = UUID(uuid: (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0))
+
     var version: Int
+    var vaultID: UUID
+    var name: String
     var generation: Int
     var accounts: [MailAccount]
     var settings: AppSettings
 
-    static func empty() -> VaultPayload {
-        VaultPayload(version: 1, generation: 1, accounts: [], settings: .default)
+    static func empty(name: String = "Personal", id: UUID = UUID()) -> VaultPayload {
+        VaultPayload(version: 1, vaultID: id, name: name, generation: 1, accounts: [], settings: .default)
+    }
+
+    init(
+        version: Int,
+        vaultID: UUID,
+        name: String,
+        generation: Int,
+        accounts: [MailAccount],
+        settings: AppSettings
+    ) {
+        self.version = version
+        self.vaultID = vaultID
+        self.name = name
+        self.generation = generation
+        self.accounts = accounts
+        self.settings = settings
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        version = try container.decodeIfPresent(Int.self, forKey: .version) ?? 1
+        vaultID = try container.decodeIfPresent(UUID.self, forKey: .vaultID) ?? Self.unsignedID
+        name = try container.decodeIfPresent(String.self, forKey: .name) ?? "Personal"
+        generation = try container.decodeIfPresent(Int.self, forKey: .generation) ?? 1
+        accounts = try container.decodeIfPresent([MailAccount].self, forKey: .accounts) ?? []
+        settings = try container.decodeIfPresent(AppSettings.self, forKey: .settings) ?? .default
+    }
+}
+
+enum MCPExposure: String, Codable, CaseIterable, Identifiable, Sendable {
+    case activeOnly
+    case allUnlocked
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .activeOnly: return "Active vault only"
+        case .allUnlocked: return "All unlocked vaults"
+        }
     }
 }
 
@@ -370,6 +414,7 @@ enum MailMCPError: LocalizedError {
     case invalidInput(String)
     case conflict(String)
     case notImplemented(String)
+    case ambiguousAccount(String)
 
     var errorDescription: String? {
         switch self {
@@ -386,6 +431,7 @@ enum MailMCPError: LocalizedError {
         case .invalidInput(let m): return m
         case .conflict(let m): return m
         case .notImplemented(let m): return m
+        case .ambiguousAccount(let m): return m
         }
     }
 }

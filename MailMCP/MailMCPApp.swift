@@ -57,5 +57,9 @@ struct RootView: View {
         } message: {
             Text(appState.conflictMessage ?? "")
         }
+        .sheet(item: $appState.pendingMerge) { _ in
+            MergeVaultView()
+                .environmentObject(appState)
+        }
     }
 }
