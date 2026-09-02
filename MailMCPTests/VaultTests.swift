@@ -2,6 +2,38 @@ import XCTest
 @testable import MailMCP
 
 final class VaultTests: XCTestCase {
+    func testIMAPSettingsInferGmailHosts() throws {
+        let settings = try IMAPSettings(
+            imapHost: "",
+            imapPort: 993,
+            imapStartTLS: false,
+            smtpHost: "",
+            smtpPort: 465,
+            smtpStartTLS: false,
+            username: "you@gmail.com",
+            password: "app-password"
+        ).resolvingBlankHosts(for: "you@gmail.com")
+
+        XCTAssertEqual(settings.imapHost, "imap.gmail.com")
+        XCTAssertEqual(settings.smtpHost, "smtp.gmail.com")
+    }
+
+    func testIMAPSettingsInferCustomDomainHosts() throws {
+        let settings = try IMAPSettings(
+            imapHost: "",
+            imapPort: 993,
+            imapStartTLS: false,
+            smtpHost: "",
+            smtpPort: 465,
+            smtpStartTLS: false,
+            username: "you@example.com",
+            password: "password"
+        ).resolvingBlankHosts(for: "you@example.com")
+
+        XCTAssertEqual(settings.imapHost, "imap.example.com")
+        XCTAssertEqual(settings.smtpHost, "smtp.example.com")
+    }
+
     func testSealAndOpenRoundTrip() throws {
         let key = try VaultCrypto.deriveKey(passphrase: "correct horse battery staple", salt: Data((0..<16).map { $0 }))
         let box = try VaultCrypto.seal(plaintext: Data("hello vault".utf8), key: key)

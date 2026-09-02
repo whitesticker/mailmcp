@@ -18,9 +18,11 @@ struct ContentView: View {
                     Section("Mailboxes") {
                         ForEach(appState.accounts) { account in
                             VStack(alignment: .leading, spacing: 4) {
-                                Text(account.email)
+                                Text(account.displayName.isEmpty ? account.email : account.displayName)
                                     .font(.headline)
-                                Text(account.provider.title)
+                                Text(account.displayName.isEmpty || account.displayName == account.email
+                                     ? account.provider.title
+                                     : "\(account.email) · \(account.provider.title)")
                                     .font(.caption)
                                     .foregroundStyle(.secondary)
                                 if let error = account.lastError, !error.isEmpty {
@@ -30,7 +32,16 @@ struct ContentView: View {
                                         .lineLimit(2)
                                 }
                             }
+                            .padding(.trailing, 18)
+                            .overlay(alignment: .trailing) {
+                                Image(systemName: "line.3.horizontal")
+                                    .font(.caption)
+                                    .foregroundStyle(.tertiary)
+                            }
                             .tag(ContentSelection.account(account.id))
+                        }
+                        .onMove { offsets, destination in
+                            try? appState.moveAccounts(fromOffsets: offsets, toOffset: destination)
                         }
                     }
                 }
@@ -93,9 +104,32 @@ struct AccountDetailView: View {
     let account: MailAccount
     @State private var busy = false
     @State private var result: String?
+    @State private var showEditAccount = false
+    @State private var nickname: String
+    @State private var nicknameStatus: String?
+
+    init(account: MailAccount) {
+        self.account = account
+        _nickname = State(initialValue:
+            account.displayName == account.email ? "" : account.displayName
+        )
+    }
 
     var body: some View {
         Form {
+            Section("Nickname") {
+                TextField("Nickname (optional)", text: $nickname)
+                HStack {
+                    Button("Save nickname") {
+                        saveNickname()
+                    }
+                    if let nicknameStatus {
+                        Text(nicknameStatus)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
             LabeledContent("Email", value: account.email)
             LabeledContent("Provider", value: account.provider.title)
             LabeledContent("Added", value: account.createdAt.formatted(date: .abbreviated, time: .shortened))
@@ -113,13 +147,35 @@ struct AccountDetailView: View {
                 Task { await test() }
             }
             .disabled(busy)
+            Button("Modify account credentials…") {
+                showEditAccount = true
+            }
             Button("Remove account", role: .destructive) {
                 try? appState.removeAccount(account.id)
             }
         }
         .formStyle(.grouped)
-        .navigationTitle(account.email)
+        .navigationTitle(account.displayName.isEmpty ? account.email : account.displayName)
         .padding()
+        .onChange(of: account.displayName) { _, value in
+            nickname = value == account.email ? "" : value
+        }
+        .sheet(isPresented: $showEditAccount) {
+            AddAccountView(editingAccount: account)
+                .environmentObject(appState)
+                .frame(minWidth: 560, minHeight: 500)
+        }
+    }
+
+    private func saveNickname() {
+        do {
+            var updated = account
+            updated.displayName = nickname.trimmingCharacters(in: .whitespacesAndNewlines)
+            try appState.updateAccount(updated)
+            nicknameStatus = "Saved"
+        } catch {
+            nicknameStatus = error.localizedDescription
+        }
     }
 
     private func test() async {

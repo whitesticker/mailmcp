@@ -27,7 +27,10 @@ enum MailProviderFactory {
             guard let settings = account.imap else {
                 throw MailMCPError.invalidInput("IMAP settings missing for \(account.email)")
             }
-            return IMAPProvider(account: account, settings: settings)
+            return IMAPProvider(
+                account: account,
+                settings: try settings.resolvingBlankHosts(for: account.email)
+            )
         case .gmail:
             guard let oauth = account.oauth else {
                 throw MailMCPError.oauth("Gmail account is not signed in")

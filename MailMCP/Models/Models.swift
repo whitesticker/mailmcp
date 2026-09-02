@@ -59,6 +59,42 @@ struct IMAPSettings: Codable, Hashable, Sendable {
     var smtpStartTLS: Bool
     var username: String
     var password: String
+
+    func resolvingBlankHosts(for email: String) throws -> IMAPSettings {
+        var resolved = self
+        let domain = email.split(separator: "@").last.map(String.init)?.lowercased() ?? ""
+        guard !domain.isEmpty else {
+            throw MailMCPError.invalidInput("Enter a valid email address.")
+        }
+
+        let known: [String: (imap: String, smtp: String, smtpPort: Int, smtpStartTLS: Bool)] = [
+            "gmail.com": ("imap.gmail.com", "smtp.gmail.com", 465, false),
+            "googlemail.com": ("imap.gmail.com", "smtp.gmail.com", 465, false),
+            "icloud.com": ("imap.mail.me.com", "smtp.mail.me.com", 587, true),
+            "me.com": ("imap.mail.me.com", "smtp.mail.me.com", 587, true),
+            "mac.com": ("imap.mail.me.com", "smtp.mail.me.com", 587, true),
+            "fastmail.com": ("imap.fastmail.com", "smtp.fastmail.com", 465, false),
+            "yahoo.com": ("imap.mail.yahoo.com", "smtp.mail.yahoo.com", 465, false),
+            "outlook.com": ("outlook.office365.com", "smtp.office365.com", 587, true),
+            "hotmail.com": ("outlook.office365.com", "smtp.office365.com", 587, true),
+            "live.com": ("outlook.office365.com", "smtp.office365.com", 587, true)
+        ]
+        let defaults = known[domain] ?? ("imap.\(domain)", "smtp.\(domain)", 465, false)
+
+        if resolved.imapHost.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            resolved.imapHost = defaults.imap
+        }
+        if resolved.smtpHost.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            resolved.smtpHost = defaults.smtp
+            resolved.smtpPort = defaults.smtpPort
+            resolved.smtpStartTLS = defaults.smtpStartTLS
+        }
+        guard (1...65535).contains(resolved.imapPort),
+              (1...65535).contains(resolved.smtpPort) else {
+            throw MailMCPError.invalidInput("Ports must be between 1 and 65535.")
+        }
+        return resolved
+    }
 }
 
 struct MailAccount: Codable, Identifiable, Hashable, Sendable {
