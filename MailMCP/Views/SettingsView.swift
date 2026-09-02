@@ -36,6 +36,11 @@ struct SettingsView: View {
     @State private var nextPassphrase = ""
     @State private var confirmPassphrase = ""
     @State private var localStatus: String?
+    @State private var vaultName = ""
+    @State private var mergePassphrase = ""
+    @State private var showMergeImporter = false
+    @State private var unlockTarget: UUID?
+    @State private var unlockPassphrase = ""
 
     var body: some View {
         VStack(spacing: 0) {
@@ -83,6 +88,15 @@ struct SettingsView: View {
             .background(.bar)
         }
         .navigationTitle("Settings")
+        .onAppear {
+            vaultName = appState.activeName
+        }
+        .onChange(of: appState.activeVaultID) { _, _ in
+            vaultName = appState.activeName
+        }
+        .fileImporter(isPresented: $showMergeImporter, allowedContentTypes: [.item]) { result in
+            handleImportedVault(result)
+        }
     }
 
     private var safetyForm: some View {
@@ -113,24 +127,138 @@ struct SettingsView: View {
 
     private var vaultForm: some View {
         Form {
-            LabeledContent("Vault file", value: appState.vaultURL.path)
-            LabeledContent("Generation", value: String(appState.store.payload?.generation ?? 0))
-            Button("Export portable vault…") { exportVault() }
-            Button("Use iCloud Drive / sync folder…") { pickSyncFolder() }
-            SecureField("Current passphrase", text: $currentPassphrase)
-            SecureField("New passphrase", text: $nextPassphrase)
-            SecureField("Confirm new passphrase", text: $confirmPassphrase)
-            Button("Change passphrase") { changePassphrase() }
-            Button("Lock vault") { appState.lock() }
-            Button("Forget this Mac’s Keychain wrap", role: .destructive) {
-                try? appState.forgetDeviceKey()
+            Section {
+                ForEach(appState.registry.vaults) { vault in
+                    vaultRow(vault)
+                }
+                if let unlockTarget {
+                    SecureField(
+                        "Passphrase for \(appState.registry.descriptor(id: unlockTarget)?.name ?? "vault")",
+                        text: $unlockPassphrase
+                    )
+                    .onSubmit { unlockVault(unlockTarget) }
+                }
+                TextField("Name", text: $vaultName)
+                FlowLayout {
+                    Button("Rename") { renameVault() }
+                    Button("Export…") { exportVault() }
+                    if let unlockTarget {
+                        Button("Unlock") { unlockVault(unlockTarget) }
+                    }
+                    Button("Lock this vault") {
+                        if let id = appState.activeVaultID {
+                            appState.lockVault(id)
+                        }
+                    }
+                    Button("Lock all") { appState.lock() }
+                    Button("Remove from this Mac", role: .destructive) {
+                        if let id = appState.activeVaultID {
+                            appState.removeVaultReference(id)
+                        }
+                    }
+                }
+            } header: {
+                Text("Vaults")
+            } footer: {
+                Text("Rename labels the active vault. Export writes a portable copy. Unlock opens another vault this session; Make active selects which one mailboxes and settings use. Lock forgets the in-memory key. Remove drops it from this Mac without deleting the file.")
+            }
+
+            Section {
+                LabeledContent("Local file") {
+                    Text(appState.vaultURL.path)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                        .foregroundStyle(.secondary)
+                }
+                LabeledContent("Sync folder") {
+                    Text(appState.registry.active?.syncPath ?? appState.settings.syncFolderPath ?? "Not set")
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                        .foregroundStyle(.secondary)
+                }
+                LabeledContent("Last sync", value: lastSyncLabel)
+                FlowLayout {
+                    Button("Choose folder…") { pickSyncFolder() }
+                    Button("Sync now") { syncNow() }
+                }
+            } header: {
+                Text("Sync")
+            } footer: {
+                Text("Choose folder picks iCloud Drive, Dropbox, or any synced directory. MailMCP keeps a local encrypted copy and mirrors it there. Sync now pushes or pulls if only one side changed; if both changed you get a merge preview.")
+            }
+
+            Section {
+                SecureField("Other vault’s passphrase", text: $mergePassphrase)
+                FlowLayout {
+                    Button("Merge vault…") { showMergeImporter = true }
+                }
+            } header: {
+                Text("Merge")
+            } footer: {
+                Text("Opens another .vault, shows additions and conflicts, then writes your choices into this vault. The other file is not changed.")
+            }
+
+            Section {
+                LabeledContent("Generation", value: String(appState.activeStore?.payload?.generation ?? 0))
+                SecureField("Current passphrase", text: $currentPassphrase)
+                SecureField("New passphrase", text: $nextPassphrase)
+                SecureField("Confirm new passphrase", text: $confirmPassphrase)
+                FlowLayout {
+                    Button("Change passphrase") { changePassphrase() }
+                    Button("Forget Keychain wrap", role: .destructive) {
+                        try? appState.forgetDeviceKey()
+                    }
+                }
+            } header: {
+                Text("Passphrase")
+            } footer: {
+                Text("Change passphrase re-encrypts this vault. Forget Keychain wrap turns off Touch ID unlock on this Mac; you will type the passphrase instead.")
             }
         }
         .formStyle(.grouped)
     }
 
+    @ViewBuilder
+    private func vaultRow(_ vault: VaultDescriptor) -> some View {
+        HStack(spacing: 8) {
+            VStack(alignment: .leading, spacing: 1) {
+                Text(vault.name)
+                Text(vaultStatus(vault))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Spacer(minLength: 8)
+            if vault.id != appState.activeVaultID, appState.unlockedVaults.contains(where: { $0.id == vault.id }) {
+                Button("Make active") {
+                    try? appState.switchActiveVault(vault.id)
+                    localStatus = appState.statusMessage
+                }
+            } else if vault.id != appState.activeVaultID {
+                Button("Unlock…") { unlockTarget = vault.id }
+            }
+        }
+    }
+
+    private func vaultStatus(_ vault: VaultDescriptor) -> String {
+        let unlocked = appState.unlockedVaults.contains(where: { $0.id == vault.id })
+        if vault.id == appState.activeVaultID {
+            return unlocked ? "Active" : "Active, locked"
+        }
+        return unlocked ? "Unlocked" : "Locked"
+    }
+
     private var mcpForm: some View {
         Form {
+            Section("Agent visibility") {
+                Picker("Mailboxes agents can use", selection: mcpExposureBinding) {
+                    ForEach(MCPExposure.allCases) { value in
+                        Text(value.title).tag(value)
+                    }
+                }
+                Text("Active vault only limits agents to the selected vault. All unlocked vaults includes every vault you have unlocked this session. Duplicate emails then require the account UUID.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
             ForEach(MCPToolCatalog.groups, id: \.title) { group in
                 Section {
                     Text(group.intro)
@@ -201,6 +329,67 @@ struct SettingsView: View {
             get: { appState.settings.microsoftClientID },
             set: { value in try? appState.updateSettings { $0.microsoftClientID = value } }
         )
+    }
+
+    private var mcpExposureBinding: Binding<MCPExposure> {
+        Binding(
+            get: { appState.mcpExposure },
+            set: { appState.setMCPExposure($0) }
+        )
+    }
+
+    private var lastSyncLabel: String {
+        let descriptor = appState.registry.active
+        let status = descriptor?.lastSyncStatus.isEmpty == false ? descriptor?.lastSyncStatus : appState.lastSyncStatus
+        if let at = descriptor?.lastSyncAt {
+            return "\(at.formatted(date: .abbreviated, time: .shortened)) — \(status ?? "")"
+        }
+        return status?.isEmpty == false ? status! : "Not synced yet"
+    }
+
+    private func renameVault() {
+        do {
+            try appState.renameActiveVault(vaultName)
+            localStatus = appState.statusMessage
+        } catch {
+            localStatus = error.localizedDescription
+        }
+    }
+
+    private func unlockVault(_ id: UUID) {
+        do {
+            try appState.unlock(passphrase: unlockPassphrase, vaultID: id)
+            unlockPassphrase = ""
+            unlockTarget = nil
+            localStatus = appState.statusMessage
+        } catch {
+            localStatus = error.localizedDescription
+        }
+    }
+
+    private func handleImportedVault(_ result: Result<URL, Error>) {
+        switch result {
+        case .success(let url):
+            let accessed = url.startAccessingSecurityScopedResource()
+            defer { if accessed { url.stopAccessingSecurityScopedResource() } }
+            do {
+                try appState.prepareMerge(from: url, passphrase: mergePassphrase)
+                localStatus = "Review the merge preview."
+            } catch {
+                localStatus = error.localizedDescription
+            }
+        case .failure(let error):
+            localStatus = error.localizedDescription
+        }
+    }
+
+    private func syncNow() {
+        do {
+            _ = try appState.syncNow()
+            localStatus = appState.statusMessage
+        } catch {
+            localStatus = error.localizedDescription
+        }
     }
 
     private func exportVault() {

@@ -7,10 +7,141 @@ struct DeviceConfig: Codable, Sendable {
     var lastWrittenHash: String
 }
 
-enum DeviceConfigStore {
+struct VaultDescriptor: Codable, Identifiable, Hashable, Sendable {
+    var id: UUID
+    var name: String
+    var localPath: String
+    var syncPath: String?
+    var lastSyncedHash: String
+    var lastSyncAt: Date?
+    var lastSyncStatus: String
+
+    var localURL: URL { URL(fileURLWithPath: localPath) }
+
+    var replicaURL: URL? {
+        guard let syncPath, !syncPath.isEmpty else { return nil }
+        return URL(fileURLWithPath: syncPath, isDirectory: true).appendingPathComponent("MailMCP.vault")
+    }
+}
+
+struct VaultRegistry: Codable, Sendable {
+    var vaults: [VaultDescriptor]
+    var activeID: UUID?
+    var mcpExposure: MCPExposure
+
+    static let empty = VaultRegistry(vaults: [], activeID: nil, mcpExposure: .activeOnly)
+
+    var active: VaultDescriptor? {
+        if let activeID, let match = vaults.first(where: { $0.id == activeID }) {
+            return match
+        }
+        return vaults.first
+    }
+
+    mutating func upsert(_ descriptor: VaultDescriptor) {
+        if let index = vaults.firstIndex(where: { $0.id == descriptor.id }) {
+            vaults[index] = descriptor
+        } else {
+            vaults.append(descriptor)
+        }
+        if activeID == nil {
+            activeID = descriptor.id
+        }
+    }
+
+    mutating func replaceID(_ oldID: UUID, with newID: UUID) {
+        if let index = vaults.firstIndex(where: { $0.id == oldID }) {
+            vaults[index].id = newID
+        }
+        if activeID == oldID {
+            activeID = newID
+        }
+    }
+
+    func descriptor(id: UUID) -> VaultDescriptor? {
+        vaults.first(where: { $0.id == id })
+    }
+}
+
+enum VaultRegistryStore {
     static var url: URL {
         Paths.applicationSupport.appendingPathComponent("device-config.json")
     }
+
+    static func load() -> VaultRegistry {
+        if let data = try? Data(contentsOf: url) {
+            if let registry = decodeRegistry(data) {
+                return registry
+            }
+            if let legacy = try? JSONCoders.decoder.decode(DeviceConfig.self, from: data) {
+                let migrated = migrateLegacy(legacy)
+                try? save(migrated)
+                return migrated
+            }
+        }
+        let bootstrapped = bootstrapFromDefaultFile()
+        if !bootstrapped.vaults.isEmpty {
+            try? save(bootstrapped)
+        }
+        return bootstrapped
+    }
+
+    static func save(_ registry: VaultRegistry) throws {
+        try FileManager.default.createDirectory(at: Paths.applicationSupport, withIntermediateDirectories: true)
+        try JSONCoders.encoder.encode(registry).write(to: url, options: .atomic)
+    }
+
+    static func decodeRegistry(_ data: Data) -> VaultRegistry? {
+        guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              object["vaults"] != nil else {
+            return nil
+        }
+        return try? JSONCoders.decoder.decode(VaultRegistry.self, from: data)
+    }
+
+    static func migrateLegacy(_ config: DeviceConfig) -> VaultRegistry {
+        let id = UUID()
+        let localPath = config.vaultPath
+        let syncPath: String?
+        if config.vaultPath == Paths.defaultVaultURL.path
+            || config.vaultPath.hasPrefix(Paths.applicationSupport.path) {
+            syncPath = nil
+        } else {
+            syncPath = URL(fileURLWithPath: config.vaultPath).deletingLastPathComponent().path
+        }
+        let descriptor = VaultDescriptor(
+            id: id,
+            name: "Personal",
+            localPath: localPath,
+            syncPath: syncPath,
+            lastSyncedHash: config.lastWrittenHash,
+            lastSyncAt: nil,
+            lastSyncStatus: "Migrated from a single-vault setup."
+        )
+        return VaultRegistry(vaults: [descriptor], activeID: id, mcpExposure: .activeOnly)
+    }
+
+    static func bootstrapFromDefaultFile() -> VaultRegistry {
+        let url = Paths.defaultVaultURL
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            return .empty
+        }
+        let id = UUID()
+        let descriptor = VaultDescriptor(
+            id: id,
+            name: "Personal",
+            localPath: url.path,
+            syncPath: nil,
+            lastSyncedHash: "",
+            lastSyncAt: nil,
+            lastSyncStatus: ""
+        )
+        return VaultRegistry(vaults: [descriptor], activeID: id, mcpExposure: .activeOnly)
+    }
+}
+
+enum DeviceConfigStore {
+    static var url: URL { VaultRegistryStore.url }
 
     static func load() -> DeviceConfig? {
         guard let data = try? Data(contentsOf: url) else { return nil }
@@ -18,8 +149,7 @@ enum DeviceConfigStore {
     }
 
     static func save(_ config: DeviceConfig) throws {
-        try FileManager.default.createDirectory(at: Paths.applicationSupport, withIntermediateDirectories: true)
-        try JSONCoders.encoder.encode(config).write(to: url, options: .atomic)
+        try VaultRegistryStore.save(VaultRegistryStore.migrateLegacy(config))
     }
 }
 
@@ -39,13 +169,20 @@ enum Paths {
         applicationSupport.appendingPathComponent("pending-sends.json")
     }
 
+    static func localVaultURL(id: UUID) -> URL {
+        applicationSupport
+            .appendingPathComponent("vaults", isDirectory: true)
+            .appendingPathComponent(id.uuidString, isDirectory: true)
+            .appendingPathComponent("MailMCP.vault")
+    }
+
     static func vaultURL(syncFolder: String?) -> URL {
         if let syncFolder, !syncFolder.isEmpty {
             return URL(fileURLWithPath: syncFolder, isDirectory: true)
                 .appendingPathComponent("MailMCP.vault")
         }
-        if let stored = DeviceConfigStore.load()?.vaultPath, !stored.isEmpty {
-            return URL(fileURLWithPath: stored)
+        if let active = VaultRegistryStore.load().active {
+            return active.localURL
         }
         return defaultVaultURL
     }
@@ -58,5 +195,9 @@ enum FileHash {
             _ = CC_SHA256(buf.baseAddress, CC_LONG(data.count), &hash)
         }
         return hash.map { String(format: "%02x", $0) }.joined()
+    }
+
+    static func sha256Hex(fileAt url: URL) throws -> String {
+        sha256Hex(try Data(contentsOf: url))
     }
 }
