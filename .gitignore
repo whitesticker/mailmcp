@@ -1,0 +1,17 @@
+.DS_Store
+DerivedData/
+.derived
+.cursor/
+default.profraw
+build/
+xcuserdata/
+*.xcuserstate
+*.xccheckout
+*.xcscmblueprint
+.swiftpm/
+.vault
+*.vault
+.env
+*.p12
+*.cer
+*.mobileprovision
