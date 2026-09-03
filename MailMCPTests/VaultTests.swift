@@ -72,7 +72,18 @@ final class VaultTests: XCTestCase {
     }
 
     func testSearchCriteriaEmptyIsAll() {
-        XCTAssertTrue(true)
+        XCTAssertEqual(IMAPSearchQuery.uidSearchCriteria(from: ""), "ALL")
+        XCTAssertEqual(IMAPSearchQuery.uidSearchCriteria(from: "from:a@b.com"), "FROM \"a@b.com\"")
+        XCTAssertFalse(IMAPSearchQuery.looksLikeGmailRaw("from:amazon.com"))
+    }
+
+    func testGmailRawUnlabeledSearch() {
+        XCTAssertTrue(IMAPSearchQuery.looksLikeGmailRaw("has:nouserlabels"))
+        XCTAssertTrue(IMAPSearchQuery.looksLikeGmailRaw("has:nouserlabels -in:sent -in:inbox"))
+        XCTAssertEqual(
+            IMAPSearchQuery.uidSearchCriteria(from: "has:nouserlabels -in:sent"),
+            "X-GM-RAW \"has:nouserlabels -in:sent\""
+        )
     }
 
     func testLegacyPayloadGetsUnsignedVaultID() throws {
@@ -248,6 +259,23 @@ final class VaultTests: XCTestCase {
         let drafts = IMAPAccountImporter.parse(text)
         XCTAssertEqual(drafts.map(\.email), ["already@gmail.com", "new.one@gmail.com"])
         XCTAssertEqual(drafts.map(\.password), ["aaaa bbbb cccc dddd", "eeee ffff gggg hhhh"])
+    }
+
+    func testToolHistoryAggregateCountsAgentsAndKinds() {
+        let now = Date()
+        let calls = [
+            MCPToolCallRecord(id: UUID(), date: now.addingTimeInterval(-120), agentName: "Cursor", tool: "list_accounts", argumentsJSON: "{}", succeeded: true),
+            MCPToolCallRecord(id: UUID(), date: now.addingTimeInterval(-60), agentName: "Cursor", tool: "file_search", argumentsJSON: "{}", succeeded: true),
+            MCPToolCallRecord(id: UUID(), date: now.addingTimeInterval(-30), agentName: "Claude Code", tool: "search_messages", argumentsJSON: "{}", succeeded: false)
+        ]
+        let stats = MCPCallLog.aggregate(calls, now: now)
+        XCTAssertEqual(stats.total, 3)
+        XCTAssertEqual(stats.failed, 1)
+        XCTAssertEqual(stats.byAgent.first?.name, "Cursor")
+        XCTAssertEqual(stats.byAgent.first?.count, 2)
+        XCTAssertEqual(stats.byKind.first { $0.name == "Read only" }?.count, 2)
+        XCTAssertEqual(stats.byKind.first { $0.name == "Alter mailbox" }?.count, 1)
+        XCTAssertFalse(stats.timeline.isEmpty)
     }
 
     private func sampleIMAP(password: String) -> IMAPSettings {

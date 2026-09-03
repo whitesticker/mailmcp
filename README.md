@@ -30,3 +30,5 @@ open .derived/Build/Products/Release/MailMCP.app
 ```
 
 Agents should launch `mailmcp-mcp` (inside the app bundle). That helper forwards to the running MailMCP app; quit the app and the agent disconnects.
+
+See [docs/roadmap.md](docs/roadmap.md) for upcoming work.

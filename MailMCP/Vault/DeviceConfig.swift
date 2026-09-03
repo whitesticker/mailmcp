@@ -29,18 +29,34 @@ struct VaultRegistry: Codable, Sendable {
     var activeID: UUID?
     var mcpExposure: MCPExposure
     var keepRunningOnCommandQ: Bool
+    var persistToolHistory: Bool
+    var toolHistoryLimit: Int
 
-    static let empty = VaultRegistry(vaults: [], activeID: nil, mcpExposure: .activeOnly, keepRunningOnCommandQ: true)
+    static let empty = VaultRegistry(
+        vaults: [],
+        activeID: nil,
+        mcpExposure: .activeOnly,
+        keepRunningOnCommandQ: true
+    )
 
     enum CodingKeys: String, CodingKey {
-        case vaults, activeID, mcpExposure, keepRunningOnCommandQ
+        case vaults, activeID, mcpExposure, keepRunningOnCommandQ, persistToolHistory, toolHistoryLimit
     }
 
-    init(vaults: [VaultDescriptor], activeID: UUID?, mcpExposure: MCPExposure, keepRunningOnCommandQ: Bool = true) {
+    init(
+        vaults: [VaultDescriptor],
+        activeID: UUID?,
+        mcpExposure: MCPExposure,
+        keepRunningOnCommandQ: Bool = true,
+        persistToolHistory: Bool = false,
+        toolHistoryLimit: Int = MCPCallLog.defaultHistoryLimit
+    ) {
         self.vaults = vaults
         self.activeID = activeID
         self.mcpExposure = mcpExposure
         self.keepRunningOnCommandQ = keepRunningOnCommandQ
+        self.persistToolHistory = persistToolHistory
+        self.toolHistoryLimit = MCPCallLog.clampedLimit(toolHistoryLimit)
     }
 
     init(from decoder: Decoder) throws {
@@ -49,6 +65,10 @@ struct VaultRegistry: Codable, Sendable {
         activeID = try container.decodeIfPresent(UUID.self, forKey: .activeID)
         mcpExposure = try container.decodeIfPresent(MCPExposure.self, forKey: .mcpExposure) ?? .activeOnly
         keepRunningOnCommandQ = try container.decodeIfPresent(Bool.self, forKey: .keepRunningOnCommandQ) ?? true
+        persistToolHistory = try container.decodeIfPresent(Bool.self, forKey: .persistToolHistory) ?? false
+        toolHistoryLimit = MCPCallLog.clampedLimit(
+            try container.decodeIfPresent(Int.self, forKey: .toolHistoryLimit) ?? MCPCallLog.defaultHistoryLimit
+        )
     }
 
     var active: VaultDescriptor? {
@@ -195,6 +215,10 @@ enum Paths {
 
     static var pendingIMAPImportURL: URL {
         applicationSupport.appendingPathComponent("pending-imap-import-path")
+    }
+
+    static var toolHistoryURL: URL {
+        applicationSupport.appendingPathComponent("tool-history.json")
     }
 
     static func localVaultURL(id: UUID) -> URL {

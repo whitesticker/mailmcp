@@ -17,10 +17,11 @@ enum MailMCPTools {
         ),
         tool(
             "search_messages",
-            "Search messages in a mailbox. For Gmail, query uses Gmail search syntax. For IMAP, supports from:, to:, subject:, and free text.",
+            "Search messages in a mailbox. IMAP: from:, to:, subject:, in:all. Gmail also supports has:nouserlabels and other web operators via X-GM-RAW.",
             [
                 "account_id": stringProp("Account UUID or email. Optional if only one account exists."),
-                "query": stringProp("Search query."),
+                "query": stringProp("Search query. IMAP: from:, to:, subject:, in:all / in:inbox."),
+                "mailbox": stringProp("Optional folder to search. Use all for Gmail All Mail. Same as in:all."),
                 "limit": numberProp("Maximum messages to return (default 20).")
             ]
         ),
@@ -188,6 +189,18 @@ enum MailMCPTools {
             required: ["message_id"]
         ),
         tool(
+            "file_search",
+            "Move or label every match for a search into a folder. Creates the folder if needed. Use mailbox=all for Gmail All Mail (COPY/label, does not leave All Mail). Gmail queries like has:nouserlabels work. Empty query is refused.",
+            [
+                "account_id": stringProp("Account UUID or email."),
+                "query": stringProp("Required search. IMAP: from:, to:, subject:, in:all. Gmail: has:nouserlabels and other web operators."),
+                "folder": stringProp("Destination folder, e.g. Amazon/Order."),
+                "mailbox": stringProp("Optional source folder. all = Gmail All Mail. Default Inbox."),
+                "limit": numberProp("Optional max messages to file this call. Use 200 for unlabeled Inbox pulls.")
+            ],
+            required: ["query", "folder"]
+        ),
+        tool(
             "snooze_message",
             "Hide a message from inbox_digest until a time. Local to this Mac; does not email anyone.",
             [
@@ -270,7 +283,12 @@ enum MailMCPTools {
         case "search_messages":
             let account = try state.resolveAccount(idOrEmail: string(arguments["account_id"]))
             let mail = try state.provider(for: account)
-            let query = string(arguments["query"]) ?? ""
+            var query = string(arguments["query"]) ?? ""
+            if let mailbox = string(arguments["mailbox"])?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !mailbox.isEmpty,
+               !query.lowercased().contains("in:") {
+                query = query.isEmpty ? "in:\(mailbox)" : "in:\(mailbox) \(query)"
+            }
             let limit = int(arguments["limit"]) ?? 20
             let result = try await mail.search(query: query, limit: limit)
             return try encode(SearchResult(account: account.email, total: result.count, returned: result.count, messages: result))
@@ -438,6 +456,32 @@ enum MailMCPTools {
                 removeLabels: strings(arguments["remove_labels"])
             )
             return try encode(["status": "filed", "message_id": id])
+
+        case "file_search":
+            let account = try state.resolveAccount(idOrEmail: string(arguments["account_id"]))
+            try state.assertSafety(.drafts, for: account)
+            let mail = try state.provider(for: account)
+            guard let query = string(arguments["query"])?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !query.isEmpty else {
+                throw MailMCPError.invalidInput("query is required; refusing to file the entire mailbox")
+            }
+            guard let folder = string(arguments["folder"])?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !folder.isEmpty else {
+                throw MailMCPError.invalidInput("folder is required")
+            }
+            let mailbox = string(arguments["mailbox"])?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let limit = int(arguments["limit"])
+            let filed = try await mail.fileMatching(query: query, folder: folder, mailbox: mailbox, limit: limit)
+            var payload: [String: Any] = [
+                "status": "filed",
+                "account": account.email,
+                "query": query,
+                "folder": folder,
+                "mailbox": mailbox ?? "INBOX",
+                "filed": filed
+            ]
+            if let limit { payload["limit"] = limit }
+            return try encode(payload)
 
         case "snooze_message":
             let account = try state.resolveAccount(idOrEmail: string(arguments["account_id"]))

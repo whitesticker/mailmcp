@@ -93,8 +93,8 @@ final class IMAPClient {
         return try search(query: "", limit: Int.max).count
     }
 
-    func search(query: String, limit: Int) throws -> [String] {
-        let criteria = Self.searchCriteria(from: query)
+    func search(query: String, limit: Int, oldestFirst: Bool = false) throws -> [String] {
+        let criteria = IMAPSearchQuery.uidSearchCriteria(from: query)
         let cap = max(limit, 1)
         if criteria == "ALL" {
             return try fetchRecent(limit: cap).map(\.uid)
@@ -108,7 +108,40 @@ final class IMAPClient {
             let parts = line.split(separator: " ").dropFirst(2).map(String.init)
             uids.append(contentsOf: parts.filter { !$0.isEmpty })
         }
-        return Array(uids.suffix(cap))
+        return oldestFirst ? Array(uids.prefix(cap)) : Array(uids.suffix(cap))
+    }
+
+    func resolveMailbox(_ raw: String?) throws -> String {
+        let token = (raw ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        if token.isEmpty || token.lowercased() == "inbox" { return "INBOX" }
+        let lower = token.lowercased()
+        if ["all", "allmail", "all mail", "[gmail]/all mail"].contains(lower) {
+            return try specialFolder(matching: ["[Gmail]/All Mail", "[Google Mail]/All Mail"], flag: "\\All")
+        }
+        return token
+    }
+
+    func copy(uids: [String], to mailbox: String) throws {
+        let chunk = 80
+        var index = 0
+        while index < uids.count {
+            let end = min(index + chunk, uids.count)
+            let set = uids[index..<end].joined(separator: ",")
+            _ = try command("UID COPY \(set) \(Self.quote(mailbox))")
+            index = end
+        }
+    }
+
+    func createMailboxPath(_ folder: String) throws {
+        if folder.caseInsensitiveCompare("INBOX") == .orderedSame { return }
+        let existing = Set(try listFolders().map { $0.name.lowercased() })
+        var parts: [String] = []
+        for part in folder.split(separator: "/").map(String.init) where !part.isEmpty {
+            parts.append(part)
+            let path = parts.joined(separator: "/")
+            if existing.contains(path.lowercased()) { continue }
+            _ = try? command("CREATE \(Self.quote(path))")
+        }
     }
 
     func fetch(uids: [String]) throws -> [IMAPFetchResult] {
@@ -269,31 +302,6 @@ final class IMAPClient {
         return "\"\(escaped)\""
     }
 
-    private static func searchCriteria(from query: String) -> String {
-        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        if trimmed.isEmpty { return "ALL" }
-        let lower = trimmed.lowercased()
-        if lower == "is:unread" || lower == "unseen" { return "UNSEEN" }
-        var remaining = trimmed
-        var parts: [String] = []
-        let prefixes = [("from:", "FROM"), ("to:", "TO"), ("subject:", "SUBJECT")]
-        for (prefix, atom) in prefixes {
-            if let range = remaining.range(of: prefix, options: .caseInsensitive) {
-                let after = remaining[range.upperBound...]
-                let token = after.split(whereSeparator: { $0.isWhitespace }).first.map(String.init) ?? ""
-                if !token.isEmpty {
-                    parts.append("\(atom) \(quote(token))")
-                    remaining = remaining.replacingOccurrences(of: prefix + token, with: "", options: .caseInsensitive)
-                }
-            }
-        }
-        remaining = remaining.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !remaining.isEmpty {
-            parts.append("TEXT \(quote(remaining))")
-        }
-        return parts.isEmpty ? "ALL" : parts.joined(separator: " ")
-    }
-
     private static func trailingLiteralSize(_ line: String) -> Int? {
         guard let open = line.lastIndex(of: "{"), let close = line.lastIndex(of: "}"), open < close else {
             return nil
@@ -401,5 +409,50 @@ final class IMAPClient {
         guard let range = line.range(of: token, options: .caseInsensitive) else { return nil }
         let rest = String(line[range.lowerBound...])
         return extractParenthetical(rest)
+    }
+}
+
+enum IMAPSearchQuery {
+    static func looksLikeGmailRaw(_ query: String) -> Bool {
+        let lower = query.lowercased()
+        let markers = [
+            "has:", "label:", "-in:", "-label:", "nouserlabels",
+            "category:", "filename:", "older_than:", "newer_than:"
+        ]
+        return markers.contains { lower.contains($0) }
+    }
+
+    static func uidSearchCriteria(from query: String) -> String {
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty { return "ALL" }
+        let lower = trimmed.lowercased()
+        if lower == "is:unread" || lower == "unseen" { return "UNSEEN" }
+        if looksLikeGmailRaw(trimmed) {
+            return "X-GM-RAW \(quote(trimmed))"
+        }
+        var remaining = trimmed
+        var parts: [String] = []
+        let prefixes = [("from:", "FROM"), ("to:", "TO"), ("subject:", "SUBJECT")]
+        for (prefix, atom) in prefixes {
+            if let range = remaining.range(of: prefix, options: .caseInsensitive) {
+                let after = remaining[range.upperBound...]
+                let token = after.split(whereSeparator: { $0.isWhitespace }).first.map(String.init) ?? ""
+                if !token.isEmpty {
+                    parts.append("\(atom) \(quote(token))")
+                    remaining = remaining.replacingOccurrences(of: prefix + token, with: "", options: .caseInsensitive)
+                }
+            }
+        }
+        remaining = remaining.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !remaining.isEmpty {
+            parts.append("TEXT \(quote(remaining))")
+        }
+        return parts.isEmpty ? "ALL" : parts.joined(separator: " ")
+    }
+
+    private static func quote(_ value: String) -> String {
+        let escaped = value.replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+        return "\"\(escaped)\""
     }
 }
