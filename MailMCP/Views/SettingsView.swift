@@ -287,7 +287,7 @@ struct SettingsView: View {
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 } else {
-                    Text("Agents are talking to this running app. Quit MailMCP from the menu bar to disconnect them.")
+                    Text("Agents are talking to this running app. Quit MailMCP from the menu bar to disconnect them. Unlock stays in memory until you lock, quit, or the app is restarted — there is no idle timeout.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }

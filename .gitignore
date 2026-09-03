@@ -13,6 +13,7 @@ xcuserdata/
 .vault
 *.vault
 .env
+.tmp-*.py
 *.p12
 *.cer
 *.mobileprovision

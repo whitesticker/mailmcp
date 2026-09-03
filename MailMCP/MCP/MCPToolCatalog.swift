@@ -5,6 +5,15 @@ enum MCPToolAudience: String, Sendable {
     case mailboxAdd
     case mailboxAlter
     case reachesOthers
+
+    var title: String {
+        switch self {
+        case .readOnly: return "Read only"
+        case .mailboxAdd: return "Add to mailbox"
+        case .mailboxAlter: return "Alter mailbox"
+        case .reachesOthers: return "Reaches others"
+        }
+    }
 }
 
 struct MCPToolInfo: Identifiable, Hashable, Sendable {
@@ -36,6 +45,7 @@ enum MCPToolCatalog {
 
         MCPToolInfo(name: "modify_message", title: "Modify message", intro: "Archive, trash, read/unread, or change labels. Only your mailbox.", audience: .mailboxAlter),
         MCPToolInfo(name: "file_message", title: "File message", intro: "Moves a message into a folder or applies labels. Nobody else is notified.", audience: .mailboxAlter),
+        MCPToolInfo(name: "file_search", title: "File search", intro: "Moves or labels every match for a search into a folder. mailbox=all searches Gmail All Mail. has:nouserlabels works. Empty query is refused.", audience: .mailboxAlter),
         MCPToolInfo(name: "update_draft", title: "Update draft", intro: "Edits an existing draft. Does not send.", audience: .mailboxAlter),
         MCPToolInfo(name: "delete_draft", title: "Delete draft", intro: "Deletes a draft from your mailbox.", audience: .mailboxAlter),
 
@@ -50,6 +60,10 @@ enum MCPToolCatalog {
     static var mailboxAlter: [MCPToolInfo] { all.filter { $0.audience == .mailboxAlter } }
     static var mailboxOnly: [MCPToolInfo] { mailboxAdd + mailboxAlter }
     static var reachesOthers: [MCPToolInfo] { all.filter { $0.audience == .reachesOthers } }
+
+    static func audience(forTool name: String) -> MCPToolAudience? {
+        all.first { $0.name == name }?.audience
+    }
 
     static var groups: [(title: String, intro: String, tools: [MCPToolInfo])] {
         [

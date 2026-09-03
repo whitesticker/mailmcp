@@ -93,6 +93,9 @@ final class AppState: ObservableObject {
         registry = VaultRegistryStore.load()
         vaultURL = registry.active?.localURL ?? Paths.defaultVaultURL
         pendingSends = PendingSendStore.load()
+        if registry.persistToolHistory {
+            mcpToolHistory = Array(ToolHistoryStore.load().prefix(toolHistoryLimit))
+        }
     }
 
     var keepRunningOnCommandQ: Bool {
@@ -145,13 +148,51 @@ final class AppState: ObservableObject {
             succeeded: succeeded
         )
         mcpToolHistory.insert(record, at: 0)
-        if mcpToolHistory.count > MCPCallLog.historyLimit {
-            mcpToolHistory.removeLast(mcpToolHistory.count - MCPCallLog.historyLimit)
+        trimMCPToolHistory()
+    }
+
+    var persistToolHistory: Bool {
+        get { registry.persistToolHistory }
+        set {
+            registry.persistToolHistory = newValue
+            persistRegistry()
+            if newValue {
+                trimMCPToolHistory()
+            } else {
+                ToolHistoryStore.remove()
+                if mcpToolHistory.count > MCPCallLog.defaultHistoryLimit {
+                    mcpToolHistory = Array(mcpToolHistory.prefix(MCPCallLog.defaultHistoryLimit))
+                }
+            }
+            objectWillChange.send()
+        }
+    }
+
+    var toolHistoryLimit: Int {
+        get { persistToolHistory ? MCPCallLog.clampedLimit(registry.toolHistoryLimit) : MCPCallLog.defaultHistoryLimit }
+        set {
+            registry.toolHistoryLimit = MCPCallLog.clampedLimit(newValue)
+            persistRegistry()
+            trimMCPToolHistory()
+            objectWillChange.send()
         }
     }
 
     func clearMCPToolHistory() {
         mcpToolHistory.removeAll()
+        if persistToolHistory {
+            ToolHistoryStore.remove()
+        }
+    }
+
+    private func trimMCPToolHistory() {
+        let limit = toolHistoryLimit
+        if mcpToolHistory.count > limit {
+            mcpToolHistory.removeLast(mcpToolHistory.count - limit)
+        }
+        if persistToolHistory {
+            ToolHistoryStore.save(mcpToolHistory)
+        }
     }
 
     func noteCommandQParked() {

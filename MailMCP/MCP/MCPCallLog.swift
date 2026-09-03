@@ -11,7 +11,7 @@ struct MCPAgentConnection: Identifiable, Equatable, Sendable {
     }
 }
 
-struct MCPToolCallRecord: Identifiable, Equatable, Sendable {
+struct MCPToolCallRecord: Identifiable, Equatable, Codable, Sendable {
     var id: UUID
     var date: Date
     var agentName: String
@@ -20,8 +20,104 @@ struct MCPToolCallRecord: Identifiable, Equatable, Sendable {
     var succeeded: Bool
 }
 
+struct MCPHistoryBucket: Identifiable, Equatable, Sendable {
+    var id: String { name }
+    var name: String
+    var count: Int
+    var failed: Int
+}
+
+struct MCPHistoryPoint: Identifiable, Equatable, Sendable {
+    var id: Date { date }
+    var date: Date
+    var count: Int
+}
+
+struct MCPToolHistoryAggregate: Equatable, Sendable {
+    var total: Int
+    var failed: Int
+    var byAgent: [MCPHistoryBucket]
+    var byTool: [MCPHistoryBucket]
+    var byKind: [MCPHistoryBucket]
+    var timeline: [MCPHistoryPoint]
+}
+
+enum ToolHistoryStore {
+    static var url: URL { Paths.toolHistoryURL }
+
+    static func load() -> [MCPToolCallRecord] {
+        guard let data = try? Data(contentsOf: url) else { return [] }
+        return (try? JSONCoders.decoder.decode([MCPToolCallRecord].self, from: data)) ?? []
+    }
+
+    static func save(_ items: [MCPToolCallRecord]) {
+        try? FileManager.default.createDirectory(at: Paths.applicationSupport, withIntermediateDirectories: true)
+        try? JSONCoders.encoder.encode(items).write(to: url, options: .atomic)
+    }
+
+    static func remove() {
+        try? FileManager.default.removeItem(at: url)
+    }
+}
+
 enum MCPCallLog {
-    static let historyLimit = 200
+    static let defaultHistoryLimit = 500
+    static let minHistoryLimit = 50
+    static let maxHistoryLimit = 5000
+    static let historyLimit = defaultHistoryLimit
+
+    static func clampedLimit(_ value: Int) -> Int {
+        min(max(value, minHistoryLimit), maxHistoryLimit)
+    }
+
+    static func aggregate(_ calls: [MCPToolCallRecord], now: Date = Date()) -> MCPToolHistoryAggregate {
+        var agentCounts: [String: (count: Int, failed: Int)] = [:]
+        var toolCounts: [String: (count: Int, failed: Int)] = [:]
+        var kindCounts: [String: (count: Int, failed: Int)] = [:]
+        for call in calls {
+            bump(&agentCounts, call.agentName, failed: !call.succeeded)
+            bump(&toolCounts, call.tool, failed: !call.succeeded)
+            let kind = MCPToolCatalog.audience(forTool: call.tool)?.title ?? "Other"
+            bump(&kindCounts, kind, failed: !call.succeeded)
+        }
+        return MCPToolHistoryAggregate(
+            total: calls.count,
+            failed: calls.filter { !$0.succeeded }.count,
+            byAgent: buckets(agentCounts),
+            byTool: Array(buckets(toolCounts).prefix(12)),
+            byKind: buckets(kindCounts),
+            timeline: timeline(calls, now: now)
+        )
+    }
+
+    private static func bump(
+        _ table: inout [String: (count: Int, failed: Int)],
+        _ key: String,
+        failed: Bool
+    ) {
+        let current = table[key] ?? (0, 0)
+        table[key] = (current.count + 1, current.failed + (failed ? 1 : 0))
+    }
+
+    private static func buckets(_ table: [String: (count: Int, failed: Int)]) -> [MCPHistoryBucket] {
+        table.map { MCPHistoryBucket(name: $0.key, count: $0.value.count, failed: $0.value.failed) }
+            .sorted { lhs, rhs in
+                if lhs.count != rhs.count { return lhs.count > rhs.count }
+                return lhs.name.localizedCaseInsensitiveCompare(rhs.name) == .orderedAscending
+            }
+    }
+
+    private static func timeline(_ calls: [MCPToolCallRecord], now: Date) -> [MCPHistoryPoint] {
+        guard let oldest = calls.map(\.date).min() else { return [] }
+        let span = now.timeIntervalSince(oldest)
+        let step: TimeInterval = span > 6 * 3600 ? 3600 : (span > 1800 ? 300 : 60)
+        var counts: [TimeInterval: Int] = [:]
+        for call in calls {
+            let slot = (call.date.timeIntervalSince1970 / step).rounded(.down) * step
+            counts[slot, default: 0] += 1
+        }
+        return counts.keys.sorted().map { MCPHistoryPoint(date: Date(timeIntervalSince1970: $0), count: counts[$0] ?? 0) }
+    }
 
     private static let secretKeys: Set<String> = [
         "password", "passphrase", "pass", "secret", "token",

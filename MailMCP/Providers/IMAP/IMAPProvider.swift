@@ -44,20 +44,40 @@ struct IMAPProvider: MailProviding {
             if trimmed.lowercased() == "is:unread" || trimmed.lowercased() == "unseen" {
                 return try await server.mailboxStatus("INBOX").unseenCount ?? 0
             }
-            try await server.selectMailbox("INBOX")
+            let (source, remaining) = Self.splitMailbox(from: query)
+            let mailboxName = try await Self.resolveSourceMailbox(server, source)
+            if remaining.isEmpty {
+                return try await server.mailboxStatus(mailboxName).messageCount ?? 0
+            }
+            if remaining.lowercased() == "is:unread" || remaining.lowercased() == "unseen" {
+                return try await server.mailboxStatus(mailboxName).unseenCount ?? 0
+            }
+            try await server.selectMailbox(mailboxName)
             let matches: MessageIdentifierSet<UID> = try await server.search(
-                criteria: Self.searchCriteria(from: query)
+                criteria: Self.searchCriteria(from: remaining)
             )
             return matches.count
         }
     }
 
     func search(query: String, limit: Int) async throws -> [MailSummary] {
-        try await withServer { server in
-            let mailbox = try await server.selectMailbox("INBOX")
-            let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        let (source, remaining) = Self.splitMailbox(from: query)
+        let trimmed = remaining.trimmingCharacters(in: .whitespacesAndNewlines)
+        let cap = max(limit, 1)
+        if IMAPSearchQuery.looksLikeGmailRaw(trimmed) {
+            let rawUIDs = try await gmailRawUIDs(query: trimmed, mailbox: source, limit: cap)
+            return try await withServer { server in
+                let mailboxName = try await Self.resolveSourceMailbox(server, source)
+                try await server.selectMailbox(mailboxName)
+                let parsed = try rawUIDs.map { try Self.uid(from: $0) }
+                let infos = try await Self.fetchInfos(server: server, uids: parsed)
+                return infos.reversed().map { self.summary(from: $0) }
+            }
+        }
+        return try await withServer { server in
+            let mailboxName = try await Self.resolveSourceMailbox(server, source)
+            let mailbox = try await server.selectMailbox(mailboxName)
             let lower = trimmed.lowercased()
-            let cap = max(limit, 1)
             let infos: [MessageInfo]
             if trimmed.isEmpty {
                 infos = try await Self.fetchLatest(server: server, mailbox: mailbox, limit: cap)
@@ -65,12 +85,12 @@ struct IMAPProvider: MailProviding {
                 infos = try await Self.fetchLatestUnseen(server: server, mailbox: mailbox, limit: cap)
             } else {
                 let matches: MessageIdentifierSet<UID> = try await server.search(
-                    criteria: Self.searchCriteria(from: query)
+                    criteria: Self.searchCriteria(from: trimmed)
                 )
                 let uids = Array(matches.toArray().suffix(cap))
                 infos = try await Self.fetchInfos(server: server, uids: uids)
             }
-            return infos.reversed().map { summary(from: $0) }
+            return infos.reversed().map { self.summary(from: $0) }
         }
     }
 
@@ -82,8 +102,14 @@ struct IMAPProvider: MailProviding {
                 let uid = try Self.uid(from: String(id.dropFirst(6)))
                 return try await loadMessage(server: server, uid: uid)
             }
-            try await server.selectMailbox("INBOX")
-            return try await loadMessage(server: server, uid: try Self.uid(from: id))
+            let uid = try Self.uid(from: id)
+            do {
+                try await server.selectMailbox("INBOX")
+                return try await loadMessage(server: server, uid: uid)
+            } catch {
+                try await server.selectMailbox(try await Self.resolveSourceMailbox(server, "all"))
+                return try await loadMessage(server: server, uid: uid)
+            }
         }
     }
 
@@ -213,6 +239,9 @@ struct IMAPProvider: MailProviding {
 
     func fileMessage(id: String, folder: String?, addLabels: [String], removeLabels: [String]) async throws {
         try await withServer { server in
+            if let folder, !folder.isEmpty {
+                try await Self.ensureMailboxPath(server, folder)
+            }
             try await server.selectMailbox("INBOX")
             let uid = try Self.uid(from: id)
             if let folder, !folder.isEmpty {
@@ -224,6 +253,51 @@ struct IMAPProvider: MailProviding {
             if !removeLabels.isEmpty {
                 try await server.store(flags: Self.flags(from: removeLabels), on: MessageIdentifierSet(uid), operation: .remove)
             }
+        }
+    }
+
+    func fileMatching(query: String, folder: String, mailbox: String? = nil, limit: Int? = nil) async throws -> Int {
+        var trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            throw MailMCPError.invalidInput("query is required; refusing to file the entire mailbox")
+        }
+        let dest = folder.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !dest.isEmpty else {
+            throw MailMCPError.invalidInput("folder is required")
+        }
+        if let mailbox, !mailbox.isEmpty, !trimmed.lowercased().contains("in:") {
+            trimmed = "in:\(mailbox) \(trimmed)"
+        }
+        let (source, remaining) = Self.splitMailbox(from: trimmed)
+        if IMAPSearchQuery.looksLikeGmailRaw(remaining) {
+            return try await gmailRawFile(query: remaining, destination: dest, mailbox: source, limit: limit)
+        }
+        return try await withServer { server in
+            try await Self.ensureMailboxPath(server, dest)
+            let mailboxName = try await Self.resolveSourceMailbox(server, source)
+            try await server.selectMailbox(mailboxName)
+            let matches: MessageIdentifierSet<UID> = try await server.search(
+                criteria: Self.searchCriteria(from: remaining)
+            )
+            var uids = matches.toArray()
+            if let limit, limit > 0 {
+                uids = Array(uids.prefix(limit))
+            }
+            guard !uids.isEmpty else { return 0 }
+            let copyOnly = Self.isAllMail(mailboxName)
+            let chunkSize = 80
+            var index = 0
+            while index < uids.count {
+                let end = min(index + chunkSize, uids.count)
+                let set = MessageIdentifierSet(Array(uids[index..<end]))
+                if copyOnly {
+                    try await server.copy(messages: set, to: dest)
+                } else {
+                    try await server.move(messages: set, to: dest)
+                }
+                index = end
+            }
+            return uids.count
         }
     }
 
@@ -375,6 +449,50 @@ struct IMAPProvider: MailProviding {
         }
     }
 
+    private func gmailRawUIDs(query: String, mailbox: String?, limit: Int, oldestFirst: Bool = true) async throws -> [String] {
+        let settings = self.settings
+        let accountID = account.id
+        return try await Task.detached {
+            let gate = IMAPAccountGate.lock(for: accountID)
+            gate.lock()
+            defer { gate.unlock() }
+            let client = IMAPClient(settings: settings)
+            try client.connect()
+            defer { client.disconnect() }
+            let name = try client.resolveMailbox(mailbox)
+            try client.select(name)
+            return try client.search(query: query, limit: limit, oldestFirst: oldestFirst)
+        }.value
+    }
+
+    private func gmailRawFile(query: String, destination: String, mailbox: String?, limit: Int?) async throws -> Int {
+        let settings = self.settings
+        let accountID = account.id
+        let cap = limit ?? Int.max
+        return try await Task.detached {
+            let gate = IMAPAccountGate.lock(for: accountID)
+            gate.lock()
+            defer { gate.unlock() }
+            let client = IMAPClient(settings: settings)
+            try client.connect()
+            defer { client.disconnect() }
+            try client.createMailboxPath(destination)
+            let name = try client.resolveMailbox(mailbox ?? "all")
+            try client.select(name)
+            let uids = try client.search(query: query, limit: max(cap, 1), oldestFirst: true)
+            guard !uids.isEmpty else { return 0 }
+            if name.localizedCaseInsensitiveContains("all mail")
+                || destination.caseInsensitiveCompare("INBOX") == .orderedSame {
+                try client.copy(uids: uids, to: destination)
+            } else {
+                for uid in uids {
+                    try client.move(uid: uid, to: destination)
+                }
+            }
+            return uids.count
+        }.value
+    }
+
     private func withServer<T: Sendable>(_ work: @escaping @Sendable (IMAPServer) async throws -> T) async throws -> T {
         let settings = self.settings
         let accountID = account.id
@@ -444,6 +562,43 @@ struct IMAPProvider: MailProviding {
         return try await server.fetchMessageInfosBulk(using: MessageIdentifierSet(uids), options: .slim)
     }
 
+    private static func ensureMailboxPath(_ server: IMAPServer, _ folder: String) async throws {
+        let existing = Set((try await server.listMailboxes()).map { $0.name.lowercased() })
+        var parts: [String] = []
+        for part in folder.split(separator: "/").map(String.init) where !part.isEmpty {
+            parts.append(part)
+            let path = parts.joined(separator: "/")
+            if existing.contains(path.lowercased()) { continue }
+            try? await server.createMailbox(path)
+        }
+    }
+
+    private static func splitMailbox(from query: String) -> (String?, String) {
+        var remaining = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let token = takePrefixedToken(prefix: "in:", from: &remaining) {
+            return (token, remaining)
+        }
+        return (nil, remaining)
+    }
+
+    private static func isAllMail(_ name: String) -> Bool {
+        name.localizedCaseInsensitiveContains("all mail")
+    }
+
+    private static func resolveSourceMailbox(_ server: IMAPServer, _ raw: String?) async throws -> String {
+        let token = (raw ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        if token.isEmpty || token.lowercased() == "inbox" { return "INBOX" }
+        let lower = token.lowercased()
+        if ["all", "allmail", "all mail", "[gmail]/all mail"].contains(lower) {
+            let folders = try await server.listMailboxes()
+            if let match = folders.first(where: { $0.name.localizedCaseInsensitiveContains("All Mail") }) {
+                return match.name
+            }
+            return "[Gmail]/All Mail"
+        }
+        return token
+    }
+
     private static func searchCriteria(from query: String) -> [SearchCriteria] {
         let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
         if trimmed.isEmpty { return [.all] }
@@ -457,20 +612,53 @@ struct IMAPProvider: MailProviding {
             ("subject:", { .subject($0) })
         ]
         for (prefix, make) in prefixes {
-            if let range = remaining.range(of: prefix, options: .caseInsensitive) {
-                let after = remaining[range.upperBound...]
-                let token = after.split(whereSeparator: { $0.isWhitespace }).first.map(String.init) ?? ""
-                if !token.isEmpty {
-                    parts.append(make(token))
-                    remaining = remaining.replacingOccurrences(of: prefix + token, with: "", options: .caseInsensitive)
-                }
+            while let token = takePrefixedToken(prefix: prefix, from: &remaining) {
+                parts.append(make(token))
             }
         }
         remaining = remaining.trimmingCharacters(in: .whitespacesAndNewlines)
+        if remaining.count >= 2, remaining.hasPrefix("\""), remaining.hasSuffix("\"") {
+            remaining = String(remaining.dropFirst().dropLast())
+        }
         if !remaining.isEmpty {
             parts.append(.text(remaining))
         }
         return parts.isEmpty ? [.all] : parts
+    }
+
+    private static func takePrefixedToken(prefix: String, from remaining: inout String) -> String? {
+        guard let range = remaining.range(of: prefix, options: .caseInsensitive) else { return nil }
+        var index = range.upperBound
+        while index < remaining.endIndex, remaining[index].isWhitespace {
+            index = remaining.index(after: index)
+        }
+        guard index < remaining.endIndex else {
+            remaining.removeSubrange(range.lowerBound..<remaining.endIndex)
+            remaining = remaining.trimmingCharacters(in: .whitespacesAndNewlines)
+            return nil
+        }
+        let value: String
+        let consumedEnd: String.Index
+        if remaining[index] == "\"" {
+            let innerStart = remaining.index(after: index)
+            if let close = remaining[innerStart...].firstIndex(of: "\"") {
+                value = String(remaining[innerStart..<close])
+                consumedEnd = remaining.index(after: close)
+            } else {
+                value = String(remaining[innerStart...])
+                consumedEnd = remaining.endIndex
+            }
+        } else {
+            var end = index
+            while end < remaining.endIndex, !remaining[end].isWhitespace {
+                end = remaining.index(after: end)
+            }
+            value = String(remaining[index..<end])
+            consumedEnd = end
+        }
+        remaining.removeSubrange(range.lowerBound..<consumedEnd)
+        remaining = remaining.trimmingCharacters(in: .whitespacesAndNewlines)
+        return value.isEmpty ? nil : value
     }
 
     private static func uid(from raw: String) throws -> UID {
