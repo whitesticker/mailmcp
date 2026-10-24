@@ -148,6 +148,11 @@ final class MailboxReaderModel: ObservableObject {
     @Published private(set) var listError: String?
     @Published private(set) var messageError: String?
     @Published private(set) var remoteAllowedMessageIDs: Set<String> = []
+    /// Newer mail found by background sync, held back until the user clicks the new-mail pill.
+    @Published private(set) var incoming: [MailSummary] = []
+    /// Rows just inserted at the top; highlighted briefly.
+    @Published private(set) var freshIDs: Set<String> = []
+    @Published private(set) var scrollToTopRequest = 0
     @Published var actionError: String?
     @Published var searchText = ""
 
@@ -162,6 +167,7 @@ final class MailboxReaderModel: ObservableObject {
     private var searchTask: Task<Void, Never>?
     private var pendingRemovals: Set<String> = []
     private var started = false
+    private var freshTask: Task<Void, Never>?
 
     init(accountID: UUID, folder: String) {
         self.accountID = accountID
@@ -205,7 +211,7 @@ final class MailboxReaderModel: ObservableObject {
     }
 
     func stop() {
-        for task in [refreshTask, moreTask, messageTask, markReadTask, searchTask] {
+        for task in [refreshTask, moreTask, messageTask, markReadTask, searchTask, freshTask] {
             task?.cancel()
         }
     }
@@ -263,6 +269,11 @@ final class MailboxReaderModel: ObservableObject {
 
     private func applyFirstPage(_ hits: [MailSummary]) {
         let page = Self.sorted(hits.filter { !pendingRemovals.contains($0.id) })
+        if hasLoadedOnce, activeQuery.isEmpty {
+            let newer = newerThanShown(page)
+            if !newer.isEmpty { highlight(Set(newer.map(\.id))) }
+        }
+        incoming = []
         if hits.count >= Self.pageSize, let oldest = page.last?.date {
             let ids = Set(page.map(\.id))
             messages = page + messages.filter { !ids.contains($0.id) && ($0.date ?? .distantPast) < oldest }
@@ -327,9 +338,48 @@ final class MailboxReaderModel: ObservableObject {
 
     func cacheDidChange() {
         guard cacheActive, activeQuery.isEmpty, !isRefreshing, account?.syncScope != .off else { return }
-        let cached = cachedPage(limit: max(messages.count, Self.pageSize))
-        if !cached.isEmpty, cached != messages {
-            messages = cached
+        let held = Set(incoming.map(\.id))
+        let cached = cachedPage(limit: max(messages.count, Self.pageSize) + incoming.count + Self.pageSize)
+        guard !cached.isEmpty else { return }
+        guard hasLoadedOnce, !messages.isEmpty else {
+            if cached != messages { messages = Array(cached.prefix(max(messages.count, Self.pageSize))) }
+            return
+        }
+        // Mail newer than the top row waits behind the pill so the list doesn't jump under the reader.
+        let newer = newerThanShown(cached)
+        let newerIDs = Set(newer.map(\.id))
+        if !newer.isEmpty, newerIDs != held {
+            incoming = newer
+        }
+        let visible = Array(cached.filter { !newerIDs.contains($0.id) }.prefix(messages.count))
+        if visible != messages {
+            messages = visible
+        }
+    }
+
+    /// Reveals held-back mail at the top of the list.
+    func showIncoming() {
+        guard !incoming.isEmpty else { return }
+        let ids = Set(incoming.map(\.id))
+        messages = Self.sorted(incoming + messages.filter { !ids.contains($0.id) })
+        incoming = []
+        highlight(ids)
+        scrollToTopRequest &+= 1
+    }
+
+    private func newerThanShown(_ candidates: [MailSummary]) -> [MailSummary] {
+        let shown = Set(messages.map(\.id))
+        let top = messages.compactMap(\.date).max() ?? .distantPast
+        return candidates.filter { !shown.contains($0.id) && ($0.date ?? .distantPast) > top }
+    }
+
+    private func highlight(_ ids: Set<String>) {
+        freshIDs = ids
+        freshTask?.cancel()
+        freshTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 3_000_000_000)
+            guard !Task.isCancelled else { return }
+            withAnimation(.easeOut(duration: 0.8)) { self?.freshIDs = [] }
         }
     }
 
@@ -484,29 +534,7 @@ final class MailboxReaderModel: ObservableObject {
 
     // MARK: - Attachments
 
-    func openAttachment(_ attachment: MailAttachmentMeta, in message: MailMessage) {
-        let blocked: Set<String> = ["app", "command", "tool", "sh", "zsh", "bash", "terminal", "scpt", "applescript", "workflow", "pkg", "mpkg", "jar", "dmg"]
-        let ext = (attachment.filename as NSString).pathExtension.lowercased()
-        Task { [weak self] in
-            guard let self else { return }
-            do {
-                let directory = FileManager.default.temporaryDirectory
-                    .appendingPathComponent("MailMCP Attachments", isDirectory: true)
-                    .appendingPathComponent(UUID().uuidString, isDirectory: true)
-                try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-                let url = directory.appendingPathComponent(Self.safeFilename(attachment.filename))
-                try await self.writeAttachment(attachment, messageID: message.id, to: url)
-                if blocked.contains(ext) {
-                    NSWorkspace.shared.activateFileViewerSelecting([url])
-                } else {
-                    NSWorkspace.shared.open(url)
-                }
-            } catch {
-                self.actionError = error.localizedDescription
-            }
-        }
-    }
-
+    /// Attachments are only written where the user chooses; MailMCP keeps no copy (docs/sync-retention.md).
     func saveAttachment(_ attachment: MailAttachmentMeta, in message: MailMessage) {
         let panel = NSSavePanel()
         panel.nameFieldStringValue = Self.safeFilename(attachment.filename)
@@ -668,6 +696,8 @@ struct MailboxReaderView: View {
 }
 
 private struct MessageListPane: View {
+    @EnvironmentObject private var appState: AppState
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @ObservedObject var model: MailboxReaderModel
 
     var body: some View {
@@ -675,35 +705,21 @@ private struct MessageListPane: View {
             if model.messages.isEmpty {
                 emptyState
             } else {
-                List(selection: Binding(get: { model.selectedID }, set: { model.select($0) })) {
-                    ForEach(model.messages) { message in
-                        MessageRow(message: message, showsRecipients: model.showsRecipients)
-                            .tag(message.id as String?)
-                            .contextMenu { rowMenu(message) }
-                    }
-                    if !model.reachedEnd {
-                        HStack {
-                            Spacer()
-                            ProgressView().controlSize(.small)
-                            Spacer()
+                ScrollViewReader { proxy in
+                    messageList
+                        .onChange(of: model.scrollToTopRequest) { _, _ in
+                            guard let first = model.messages.first?.id else { return }
+                            withAnimation(reduceMotion ? nil : .easeOut(duration: 0.3)) {
+                                proxy.scrollTo(first, anchor: .top)
+                            }
                         }
-                        .onAppear { model.loadMore() }
-                    }
-                }
-                .listStyle(.inset)
-                .onDeleteCommand {
-                    if model.canTrash { model.remove(id: model.selectedID, .trash) }
                 }
             }
         }
         .overlay(alignment: .top) {
-            if model.isRefreshing && !model.messages.isEmpty {
-                ProgressView()
-                    .controlSize(.small)
-                    .padding(6)
-                    .background(.regularMaterial, in: Capsule())
-                    .padding(.top, 6)
-            }
+            banner
+                .padding(.top, 8)
+                .animation(reduceMotion ? nil : .spring(response: 0.35, dampingFraction: 0.85), value: bannerKey)
         }
         .safeAreaInset(edge: .bottom) {
             if let error = model.listError, !model.messages.isEmpty {
@@ -720,6 +736,56 @@ private struct MessageListPane: View {
                 .background(.bar)
             }
         }
+    }
+
+    private var syncText: String? {
+        guard let account = model.account, appState.isSyncingCache(for: account) else { return nil }
+        return appState.syncProgressMessage(for: account) ?? "Syncing…"
+    }
+
+    private var bannerKey: String {
+        if !model.incoming.isEmpty { return "new\(model.incoming.count)" }
+        if let syncText { return "sync:\(syncText)" }
+        return model.isRefreshing && !model.messages.isEmpty ? "refresh" : "none"
+    }
+
+    @ViewBuilder
+    private var banner: some View {
+        if !model.incoming.isEmpty {
+            NewMailPill(messages: model.incoming) { model.showIncoming() }
+                .transition(.move(edge: .top).combined(with: .opacity))
+        } else if let syncText {
+            StatusPill(text: syncText)
+                .transition(.move(edge: .top).combined(with: .opacity))
+        } else if model.isRefreshing && !model.messages.isEmpty {
+            StatusPill(text: "Checking for new mail…")
+                .transition(.move(edge: .top).combined(with: .opacity))
+        }
+    }
+
+    private var messageList: some View {
+        List(selection: Binding(get: { model.selectedID }, set: { model.select($0) })) {
+                    ForEach(model.messages) { message in
+                        MessageRow(message: message, showsRecipients: model.showsRecipients)
+                            .tag(message.id as String?)
+                            .listRowBackground(
+                                model.freshIDs.contains(message.id) ? Color.accentColor.opacity(0.14) : Color.clear
+                            )
+                            .contextMenu { rowMenu(message) }
+                    }
+                    if !model.reachedEnd {
+                        HStack {
+                            Spacer()
+                            ProgressView().controlSize(.small)
+                            Spacer()
+                        }
+                        .onAppear { model.loadMore() }
+                    }
+                }
+                .listStyle(.inset)
+                .onDeleteCommand {
+                    if model.canTrash { model.remove(id: model.selectedID, .trash) }
+                }
     }
 
     @ViewBuilder
@@ -907,10 +973,10 @@ private struct MessageDetail: View {
 
     private func attachmentChip(_ attachment: MailAttachmentMeta) -> some View {
         Button {
-            model.openAttachment(attachment, in: message)
+            model.saveAttachment(attachment, in: message)
         } label: {
             HStack(spacing: 4) {
-                Image(systemName: "paperclip")
+                Image(systemName: "arrow.down.circle")
                 Text(attachment.filename)
                     .lineLimit(1)
                 if let size = attachment.size {
@@ -921,11 +987,7 @@ private struct MessageDetail: View {
             .font(.caption)
         }
         .buttonStyle(.bordered)
-        .help("Open \(attachment.filename)")
-        .contextMenu {
-            Button("Open") { model.openAttachment(attachment, in: message) }
-            Button("Save…") { model.saveAttachment(attachment, in: message) }
-        }
+        .help("Save \(attachment.filename) to a folder you choose")
     }
 
     private var remoteContentBanner: some View {
@@ -949,15 +1011,70 @@ private struct MessageDetail: View {
     }
 }
 
+/// Twitter-style "new posts" pill: avatars of the newest senders plus a count.
+private struct NewMailPill: View {
+    let messages: [MailSummary]
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 8) {
+                HStack(spacing: -7) {
+                    ForEach(Array(messages.prefix(3).enumerated()), id: \.offset) { _, message in
+                        let sender = MailDisplayFormat.address(message.from)
+                        SenderAvatar(name: sender.name, email: sender.email, size: 22)
+                            .overlay(Circle().stroke(Color.accentColor, lineWidth: 2))
+                    }
+                }
+                Text("↑ \(messages.count) new message\(messages.count == 1 ? "" : "s")")
+                    .font(.callout.weight(.semibold))
+            }
+            .padding(.leading, 5)
+            .padding(.trailing, 12)
+            .padding(.vertical, 5)
+            .foregroundStyle(.white)
+            .background(Color.accentColor, in: Capsule())
+            .shadow(color: .black.opacity(0.25), radius: 7, y: 3)
+            .contentShape(Capsule())
+        }
+        .buttonStyle(.plain)
+        .help("Show new messages")
+        .accessibilityLabel("Show \(messages.count) new message\(messages.count == 1 ? "" : "s")")
+    }
+}
+
+/// Neutral, non-interactive pill for sync progress.
+private struct StatusPill: View {
+    let text: String
+
+    var body: some View {
+        HStack(spacing: 7) {
+            ProgressView().controlSize(.mini)
+            Text(text)
+                .font(.caption)
+                .lineLimit(1)
+                .truncationMode(.middle)
+        }
+        .padding(.horizontal, 11)
+        .padding(.vertical, 5)
+        .background(.regularMaterial, in: Capsule())
+        .overlay(Capsule().stroke(Color.primary.opacity(0.1)))
+        .shadow(color: .black.opacity(0.15), radius: 5, y: 2)
+        .padding(.horizontal, 12)
+        .accessibilityElement(children: .combine)
+    }
+}
+
 private struct SenderAvatar: View {
     let name: String
     let email: String
+    var size: CGFloat = 34
 
     var body: some View {
         Text(MailDisplayFormat.initials(name))
-            .font(.system(size: 13, weight: .semibold))
+            .font(.system(size: size * 0.38, weight: .semibold))
             .foregroundStyle(.white)
-            .frame(width: 34, height: 34)
+            .frame(width: size, height: size)
             .background(Circle().fill(color.gradient))
     }
 

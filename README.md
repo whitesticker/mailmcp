@@ -2,7 +2,7 @@
 
 A local macOS app and [MCP](https://modelcontextprotocol.io) server so agents can read and organize your mail from an encrypted vault on your Mac. There is no hosted backend.
 
-Requires macOS 14 or later.
+Requires macOS 15 or later.
 
 ## Homebrew
 

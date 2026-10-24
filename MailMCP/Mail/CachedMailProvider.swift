@@ -5,22 +5,40 @@ actor MailboxSyncCoordinator {
 
     private var inflightSyncs: [UUID: Task<Void, Never>] = [:]
     private var lastCooldownAt: [UUID: Date] = [:]
-    private var proactiveAccountIDs: Set<UUID> = []
-    private var lastLazyCapCheck: Date?
-
-    func setProactiveAccounts(_ ids: Set<UUID>) {
-        proactiveAccountIDs = ids
-    }
-
     func isSyncing(accountID: UUID) -> Bool {
         inflightSyncs[accountID] != nil
     }
 
-    func enforceLazyCacheCap(policy: CacheSyncPolicy, store: MailboxCacheStore, force: Bool = false) {
-        guard let cap = policy.lazyCacheCapBytes else { return }
-        if !force, let last = lastLazyCapCheck, Date().timeIntervalSince(last) < 300 { return }
-        lastLazyCapCheck = Date()
-        store.evictLazyCache(capBytes: cap, protectedAccountIDs: proactiveAccountIDs)
+    /// Forgets cooldowns so the next read for these accounts goes to the server (after freeing space).
+    func resetCooldowns(for accountIDs: Set<UUID>) {
+        for id in accountIDs {
+            lastCooldownAt[id] = nil
+        }
+    }
+
+    /// Messages whose bodies the policy wants mirrored but that aren't cached yet.
+    /// Recent/days windows cover the Inbox only; Everything covers the whole account.
+    static func pendingBodyIDs(
+        accountID: UUID,
+        policy: CacheSyncPolicy,
+        store: MailboxCacheStore,
+        limit: Int
+    ) -> [String] {
+        guard policy.downloadsBodies else { return [] }
+        switch policy.mode {
+        case .lazy:
+            return []
+        case .rollingWindow:
+            return store.missingBodyMessageIDs(
+                accountID: accountID, limit: limit, mailbox: "INBOX", window: policy.rollingCount
+            )
+        case .timeWindow:
+            return store.missingBodyMessageIDs(
+                accountID: accountID, limit: limit, mailbox: "INBOX", since: policy.cutoffDate
+            )
+        case .fullSync:
+            return store.missingBodyMessageIDs(accountID: accountID, limit: limit)
+        }
     }
 
     /// Runs a cadence-driven sync, skipping the heavy work when the server watermark is unchanged.
@@ -34,9 +52,9 @@ actor MailboxSyncCoordinator {
         guard effectivePolicy.mode.isProactive, inflightSyncs[account.id] == nil else { return }
 
         let previous = store.accountWatermark(accountID: account.id)
-        let bodiesPending = effectivePolicy.mode == .fullSync
-            && effectivePolicy.fullSyncBodies
-            && !store.missingBodyMessageIDs(accountID: account.id, limit: 1).isEmpty
+        let bodiesPending = !Self.pendingBodyIDs(
+            accountID: account.id, policy: effectivePolicy, store: store, limit: 1
+        ).isEmpty
         if previous.lastSyncedAt != nil, !bodiesPending,
            let current = try? await provider.fetchWatermark(),
            let known = previous.watermark, known == current {
@@ -208,7 +226,7 @@ actor MailboxSyncCoordinator {
 
         let requestedTokens = policy.mode == .fullSync
             ? ["inbox", "all", "sent", "archive", "spam", "trash"]
-            : ["inbox", "spam", "trash"]
+            : ["inbox"]
         let resolved = (try? await provider.resolveMailboxes(requestedTokens)) ?? []
         var seenFolders = Set<String>()
         var targetFolders: [String] = []
@@ -245,13 +263,6 @@ actor MailboxSyncCoordinator {
             guard let summaries = try? await provider.searchFoldered(spec) else { continue }
             store.saveSummaries(summaries)
             store.addBandwidthUsage(accountID: account.id, bytes: Int64(summaries.count) * 600)
-            if policy.mode == .rollingWindow {
-                store.pruneRollingWindow(
-                    accountID: account.id,
-                    mailbox: folderName,
-                    keepLatest: policy.rollingCount
-                )
-            }
             let oldest = summaries.compactMap(\.date).min() ?? afterDate
             let isFullySynced = policy.mode == .fullSync || summaries.count < limitPerFolder
             store.updateFolderSyncState(
@@ -271,8 +282,8 @@ actor MailboxSyncCoordinator {
             syncedAt: Date()
         )
 
-        // Phase 2: Full body download for Full Sync mode (text/HTML only, skips binary attachments)
-        if policy.mode == .fullSync && policy.fullSyncBodies {
+        // Phase 2: body download for the policy's window (text/HTML only, never attachments)
+        if policy.downloadsBodies {
             let batchSize = account.provider == .gmail ? 10 : 25
             let pauseNs: UInt64 = account.provider == .gmail ? 2_000_000_000 : 150_000_000
             var attemptedInRun = Set<String>()
@@ -286,16 +297,17 @@ actor MailboxSyncCoordinator {
                     )
                     return
                 }
-                let candidates = store.missingBodyMessageIDs(accountID: account.id, limit: batchSize * 2)
-                    .filter { !attemptedInRun.contains($0) }
+                let candidates = pendingBodyIDs(
+                    accountID: account.id, policy: policy, store: store, limit: batchSize * 2
+                )
+                .filter { !attemptedInRun.contains($0) }
                 let batch = Array(candidates.prefix(batchSize))
                 guard !batch.isEmpty else { break }
                 for id in batch { attemptedInRun.insert(id) }
 
-                let currentStats = store.accountStats(accountID: account.id)
                 reportProgress(
                     account.id,
-                    "Downloading bodies: \(currentStats.bodyCount) / \(currentStats.envelopeCount)…",
+                    "Downloading message bodies (\(attemptedInRun.count) so far)…",
                     notifyUI: notifyUI
                 )
 
@@ -514,7 +526,6 @@ final class CachedMailProvider: MailProviding, @unchecked Sendable {
         let watermark = try? await base.fetchWatermark()
         if policy.lazyEnabled {
             store.recordLazyQuery(accountID: account.id, request: request, watermark: watermark)
-            await coordinator.enforceLazyCacheCap(policy: policy, store: store)
         }
         await coordinator.recordCooldown(
             accountID: account.id,
@@ -582,9 +593,6 @@ final class CachedMailProvider: MailProviding, @unchecked Sendable {
             store.saveMessage(fresh)
             let bytes = Int64(fresh.body.utf8.count + (fresh.bodyHTML?.utf8.count ?? 0) + 1024)
             store.addBandwidthUsage(accountID: account.id, bytes: bytes)
-            if policy.lazyEnabled {
-                await coordinator.enforceLazyCacheCap(policy: policy, store: store)
-            }
         }
         return fresh
     }
@@ -640,16 +648,9 @@ final class CachedMailProvider: MailProviding, @unchecked Sendable {
         return messages
     }
 
+    /// Attachments are never cached; every request goes to the server.
     func getAttachment(messageID: String, attachmentID: String) async throws -> MailAttachmentData {
-        if policy.cacheActive,
-           let cached = store.cachedAttachment(accountID: account.id, messageID: messageID, attachmentID: attachmentID) {
-            return cached
-        }
-        let fresh = try await base.getAttachment(messageID: messageID, attachmentID: attachmentID)
-        if policy.cacheActive {
-            store.saveAttachment(fresh, accountID: account.id, messageID: messageID)
-        }
-        return fresh
+        try await base.getAttachment(messageID: messageID, attachmentID: attachmentID)
     }
 
     func modify(id: String, action: MailModifyAction, label: String?) async throws {

@@ -2,7 +2,7 @@ import AppKit
 import SwiftUI
 import UniformTypeIdentifiers
 
-private enum SettingsPane: String, CaseIterable, Identifiable {
+enum SettingsPane: String, CaseIterable, Identifiable {
     case safety
     case cache
     case oauth
@@ -32,9 +32,96 @@ private enum SettingsPane: String, CaseIterable, Identifiable {
     }
 }
 
+/// Settings with a secondary list column, laid out like a mailbox's folder column.
+struct SettingsWorkspaceView: View {
+    enum Item: Hashable {
+        case addAccount
+        case addVault
+        case agents
+        case history
+        case pane(SettingsPane)
+    }
+
+    @EnvironmentObject private var appState: AppState
+    @State private var item: Item
+    @AppStorage("reader.folderColumnWidth") private var listWidth: Double = 200
+
+    private static let listRange: ClosedRange<Double> = 150...320
+    private static let contentMinWidth: Double = 560
+
+    init(initialItem: Item = .pane(.safety)) {
+        _item = State(initialValue: initialItem)
+    }
+
+    var body: some View {
+        GeometryReader { geometry in
+            let available = Double(geometry.size.width) - Double(ColumnResizeHandle.hitWidth)
+            let width = max(Self.listRange.lowerBound, min(listWidth, available - Self.contentMinWidth))
+            HStack(spacing: 0) {
+                list
+                    .frame(width: width)
+                ColumnResizeHandle(width: $listWidth, range: Self.listRange)
+                content
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+        }
+        .toolbar(removing: .title)
+    }
+
+    private var list: some View {
+        VStack(spacing: 0) {
+            ColumnTitle(text: "Settings")
+            itemList
+        }
+        .background(Color(nsColor: .controlBackgroundColor))
+    }
+
+    private var itemList: some View {
+        List(selection: Binding(get: { item }, set: { if let value = $0 { item = value } })) {
+            Section("Add") {
+                Label("Add an Account", systemImage: "envelope.badge.plus")
+                    .tag(Item.addAccount)
+                Label("Add a Vault", systemImage: "externaldrive.badge.plus")
+                    .tag(Item.addVault)
+                Label("Add to an Agent", systemImage: "puzzlepiece.extension")
+                    .tag(Item.agents)
+            }
+            Section("Activity") {
+                Label("Tool History", systemImage: "clock.arrow.circlepath")
+                    .tag(Item.history)
+            }
+            Section("Settings") {
+                ForEach(SettingsPane.allCases) { pane in
+                    Label(pane.title, systemImage: pane.icon)
+                        .tag(Item.pane(pane))
+                }
+            }
+        }
+        .listStyle(.sidebar)
+        .scrollContentBackground(.hidden)
+    }
+
+    @ViewBuilder
+    private var content: some View {
+        switch item {
+        case .addAccount:
+            AddAccountView(inline: true)
+        case .addVault:
+            AddVaultView(inline: true)
+        case .agents:
+            AgentsView()
+        case .history:
+            ToolHistoryView()
+        case .pane(let pane):
+            SettingsView(pane: pane)
+                .id(pane)
+        }
+    }
+}
+
 struct SettingsView: View {
     @EnvironmentObject private var appState: AppState
-    @State private var pane: SettingsPane = .safety
+    let pane: SettingsPane
     @State private var currentPassphrase = ""
     @State private var nextPassphrase = ""
     @State private var confirmPassphrase = ""
@@ -72,29 +159,8 @@ struct SettingsView: View {
                     .padding(.horizontal, 16)
                     .padding(.bottom, 8)
             }
-            Divider()
-            HStack(spacing: 0) {
-                ForEach(SettingsPane.allCases) { item in
-                    Button {
-                        pane = item
-                    } label: {
-                        VStack(spacing: 4) {
-                            Image(systemName: item.icon)
-                                .font(.system(size: 16, weight: .semibold))
-                            Text(item.title)
-                                .font(.caption)
-                        }
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 8)
-                        .foregroundStyle(pane == item ? Color.accentColor : Color.secondary)
-                    }
-                    .buttonStyle(.plain)
-                }
-            }
-            .padding(.horizontal, 8)
-            .background(.bar)
         }
-        .navigationTitle("Settings")
+        .navigationTitle(pane.title)
         .onAppear {
             vaultName = appState.activeName
         }
@@ -122,67 +188,54 @@ struct SettingsView: View {
     }
 
     private var cacheForm: some View {
-        Form {
-            Section("Lazy Caching") {
-                Toggle("Cache what agents read (lazy caching)", isOn: cacheEnabledBinding)
-                Text("Every mailbox saves the searches and messages agents request, so repeat requests are answered locally. Turning this off sends uncached requests to the server; mailboxes with their own background sync still answer from their synced copy.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                Picker("Lazy cache size limit", selection: lazyCapBinding) {
-                    Text("256 MB").tag(256)
-                    Text("512 MB").tag(512)
-                    Text("1 GB (Default)").tag(1024)
-                    Text("2 GB").tag(2048)
-                    Text("5 GB").tag(5120)
-                    Text("Unlimited").tag(0)
+        let usedBytes = appState.cacheUsedBytes()
+        let limitBytes = appState.settings.cachePolicy.cacheLimitBytes
+        let isOver = limitBytes.map { usedBytes > $0 } ?? false
+        return Form {
+            Section("Storage") {
+                LazyVGrid(columns: [GridItem(.adaptive(minimum: 130), spacing: 10)], spacing: 10) {
+                    SettingsTile(
+                        title: "In use",
+                        value: FreeSpaceControls.format(usedBytes),
+                        detail: limitBytes.map { "of \(FreeSpaceControls.format($0))" } ?? "No limit",
+                        tint: isOver ? .orange : nil,
+                        progress: limitBytes.map { min(Double(usedBytes) / Double(max($0, 1)), 1) }
+                    )
+                    SettingsTile(title: "Headers", value: cacheStats.messageCount.formatted())
+                    SettingsTile(title: "Bodies", value: cacheStats.bodyCount.formatted())
+                    SettingsTile(
+                        title: "On disk",
+                        value: FreeSpaceControls.format(cacheStats.sizeBytes),
+                        detail: "incl. search index"
+                    )
+                    SettingsTile(
+                        title: "Last synced",
+                        value: cacheStats.lastSyncAt?.formatted(date: .omitted, time: .shortened) ?? "Never",
+                        detail: cacheStats.lastSyncAt?.formatted(date: .abbreviated, time: .omitted)
+                    )
                 }
-                LabeledContent("Lazy cache in use") {
-                    let used = ByteCountFormatter.string(fromByteCount: appState.lazyCacheSizeBytes(), countStyle: .file)
-                    if let cap = appState.settings.cachePolicy.lazyCacheCapBytes {
-                        Text("\(used) of \(ByteCountFormatter.string(fromByteCount: cap, countStyle: .file))")
-                    } else {
-                        Text(used)
-                    }
+                .padding(.vertical, 4)
+                Picker("Cache size limit", selection: cacheLimitBinding) {
+                    Text("2 GB").tag(2_000)
+                    Text("5 GB").tag(5_000)
+                    Text("10 GB (Default)").tag(10_000)
+                    Text("20 GB").tag(20_000)
+                    Text("50 GB").tag(50_000)
+                    Text("No limit").tag(0)
                 }
-                Text("When the limit is reached, the least recently opened lazily cached mail is removed first. Mailboxes with background sync are never trimmed.")
+                Text("Headers and bodies of everything you or an agent open, plus each mailbox’s background sync. Attachments are never stored. Nothing is deleted automatically; over the limit, MailMCP asks how much to free.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
 
-            Section("Server & Bandwidth") {
-                Picker("Server check cooldown", selection: cacheCooldownBinding) {
-                    Text("30 seconds").tag(30)
-                    Text("1 minute (Default)").tag(60)
-                    Text("2 minutes").tag(120)
-                    Text("5 minutes").tag(300)
-                }
-                Picker("Daily download safety cap (per account)", selection: cacheDailyCapBinding) {
-                    Text("500 MB / day").tag(500)
-                    Text("1,000 MB / day").tag(1000)
-                    Text("1,500 MB / day (Default — under Gmail’s 2.5 GB limit)").tag(1500)
-                    Text("2,000 MB / day").tag(2000)
-                }
+            Section("Free Up Space") {
+                FreeSpaceControls()
+            }
+
+            Section("Background Sync") {
                 Toggle("Pause auto-sync on battery or Low Power Mode", isOn: pauseOnBatteryBinding)
-                Text("Background sync for individual mailboxes (scope and schedule) is set on each mailbox’s page in the sidebar.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-
-            Section("Status & Storage") {
-                LabeledContent("Cached titles / headers", value: "\(cacheStats.messageCount)")
-                LabeledContent("Cached full bodies", value: "\(cacheStats.bodyCount)")
-                LabeledContent("Cached folders", value: "\(cacheStats.folderCount)")
-                LabeledContent("Disk usage", value: ByteCountFormatter.string(fromByteCount: cacheStats.sizeBytes, countStyle: .file))
-                LabeledContent("Last synced") {
-                    if let last = cacheStats.lastSyncAt {
-                        Text(last.formatted(date: .abbreviated, time: .shortened))
-                    } else {
-                        Text("Not synced yet")
-                            .foregroundStyle(.secondary)
-                    }
-                }
                 FlowLayout {
-                    Button(isSyncingCache || !appState.syncingAccountIDs.isEmpty ? "Syncing…" : "Sync all background-synced mailboxes") {
+                    Button(isSyncingCache || !appState.syncingAccountIDs.isEmpty ? "Syncing…" : "Sync all mailboxes") {
                         isSyncingCache = true
                         Task {
                             await appState.syncMailboxCacheNow()
@@ -196,68 +249,37 @@ struct SettingsView: View {
                     .disabled(isSyncingCache || !appState.syncingAccountIDs.isEmpty || !appState.isUnlocked
                               || !appState.accounts.contains { $0.syncScope != .off })
 
-                    Button("Trim lazy cache now") {
-                        appState.trimLazyCacheNow()
-                    }
-                    .disabled(appState.settings.cachePolicy.lazyCacheCapBytes == nil)
-
                     Button("Clear all cache", role: .destructive) {
                         appState.clearMailboxCache()
                         cacheStats = MailboxCacheStore.shared.stats()
                         localStatus = "Mailbox cache cleared."
                     }
                 }
+                if !appState.accounts.isEmpty {
+                    LazyVGrid(columns: [GridItem(.adaptive(minimum: 220), spacing: 10)], spacing: 10) {
+                        ForEach(appState.accounts) { account in
+                            accountCacheTile(account)
+                        }
+                    }
+                    .padding(.vertical, 4)
+                }
+                Text("Each mailbox’s policy and schedule is set in its Mailbox Settings.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
 
-            if !appState.accounts.isEmpty {
-                Section("Per-Account Cache") {
-                    ForEach(appState.accounts) { account in
-                        let accStats = appState.cacheStats(for: account)
-                        let syncing = appState.isSyncingCache(for: account)
-                        HStack(alignment: .center, spacing: 10) {
-                            if syncing {
-                                ProgressView()
-                                    .controlSize(.small)
-                            } else {
-                                Circle()
-                                    .fill((accStats.envelopeCount > 0 || accStats.lastSyncedAt != nil) ? Color.green : Color.orange)
-                                    .frame(width: 8, height: 8)
-                            }
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text(account.displayName.isEmpty ? account.email : "\(account.displayName) (\(account.email))")
-                                    .font(.subheadline.weight(.medium))
-                                Text(accountSyncSummary(account))
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                                Text("\(accStats.envelopeCount) titles · \(accStats.bodyCount) bodies · \(accStats.folderCount) folders")
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                                if let synced = accStats.lastSyncedAt {
-                                    Text("Last synced \(synced.formatted(date: .abbreviated, time: .shortened))")
-                                        .font(.caption2)
-                                        .foregroundStyle(.tertiary)
-                                } else {
-                                    Text("Not synced yet")
-                                        .font(.caption2)
-                                        .foregroundStyle(.tertiary)
-                                }
-                            }
-                            Spacer()
-                            if account.syncScope != .off {
-                                Button(syncing ? "Syncing…" : "Sync") {
-                                    Task {
-                                        await appState.syncMailboxCacheNow(account: account)
-                                        await MainActor.run {
-                                            cacheStats = MailboxCacheStore.shared.stats()
-                                        }
-                                    }
-                                }
-                                .controlSize(.small)
-                                .disabled(syncing)
-                            }
-                        }
-                        .padding(.vertical, 2)
-                    }
+            Section("Server & Bandwidth") {
+                Picker("Server check cooldown", selection: cacheCooldownBinding) {
+                    Text("30 seconds").tag(30)
+                    Text("1 minute (Default)").tag(60)
+                    Text("2 minutes").tag(120)
+                    Text("5 minutes").tag(300)
+                }
+                Picker("Daily download cap (per mailbox)", selection: cacheDailyCapBinding) {
+                    Text("500 MB / day").tag(500)
+                    Text("1,000 MB / day").tag(1000)
+                    Text("1,500 MB / day (Default — under Gmail’s 2.5 GB limit)").tag(1500)
+                    Text("2,000 MB / day").tag(2000)
                 }
             }
         }
@@ -268,6 +290,47 @@ struct SettingsView: View {
         .onChange(of: appState.cacheRevision) { _, _ in
             cacheStats = MailboxCacheStore.shared.stats()
         }
+    }
+
+    private func accountCacheTile(_ account: MailAccount) -> some View {
+        let accStats = appState.cacheStats(for: account)
+        let syncing = appState.isSyncingCache(for: account)
+        return VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 6) {
+                if syncing {
+                    ProgressView().controlSize(.mini)
+                } else {
+                    Circle()
+                        .fill((accStats.envelopeCount > 0 || accStats.lastSyncedAt != nil) ? Color.green : Color.orange)
+                        .frame(width: 7, height: 7)
+                }
+                Text(account.displayName.isEmpty ? account.email : account.displayName)
+                    .font(.subheadline.weight(.medium))
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Spacer(minLength: 4)
+                if account.syncScope != .off {
+                    Button(syncing ? "Syncing…" : "Sync") {
+                        Task { await appState.syncMailboxCacheNow(account: account) }
+                    }
+                    .controlSize(.small)
+                    .disabled(syncing)
+                }
+            }
+            Text(accountSyncSummary(account))
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+            Text("\(accStats.envelopeCount.formatted()) headers · \(accStats.bodyCount.formatted()) bodies")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Text(accStats.lastSyncedAt.map { "Synced \($0.formatted(date: .abbreviated, time: .shortened))" } ?? "Not synced yet")
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
+        }
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
     }
 
     private var oauthForm: some View {
@@ -520,20 +583,10 @@ struct SettingsView: View {
         )
     }
 
-    private var cacheEnabledBinding: Binding<Bool> {
+    private var cacheLimitBinding: Binding<Int> {
         Binding(
-            get: { appState.settings.cachePolicy.enabled },
-            set: { value in try? appState.updateSettings { $0.cachePolicy.enabled = value } }
-        )
-    }
-
-    private var lazyCapBinding: Binding<Int> {
-        Binding(
-            get: { appState.settings.cachePolicy.lazyCacheCapMB },
-            set: { value in
-                try? appState.updateSettings { $0.cachePolicy.lazyCacheCapMB = value }
-                appState.trimLazyCacheNow()
-            }
+            get: { appState.settings.cachePolicy.cacheLimitMB },
+            set: { value in try? appState.updateSettings { $0.cachePolicy.cacheLimitMB = value } }
         )
     }
 
@@ -547,11 +600,11 @@ struct SettingsView: View {
     private func accountSyncSummary(_ account: MailAccount) -> String {
         switch account.syncScope {
         case .off:
-            return "Lazy caching only"
+            return "Off (lazy sync only)"
         case .recent:
-            return "Background sync: latest \(account.syncRecentCount) · \(account.syncSchedule.title)"
+            return "Recent \(account.syncRecentCount.formatted()) Inbox messages · \(account.syncSchedule.title)"
         case .days:
-            return "Background sync: past \(account.syncDaysBack) days · \(account.syncSchedule.title)"
+            return "Recent \(account.syncDaysBack) days of Inbox · \(account.syncSchedule.title)"
         case .everything:
             return "Background sync: everything · \(account.syncSchedule.title)"
         }
@@ -741,8 +794,7 @@ struct AgentsView: View {
             }
         }
         .formStyle(.grouped)
-        .navigationTitle("Add to an agent")
-        .padding()
+        .navigationTitle("Add to an Agent")
     }
 
     private func agentRow(_ client: MCPClientKind) -> some View {
@@ -814,5 +866,42 @@ struct AgentsView: View {
         case .notAdded: return "Add"
         case .agentMissing: return "Add"
         }
+    }
+}
+
+/// Compact stat tile used in settings panels.
+struct SettingsTile: View {
+    let title: String
+    let value: String
+    var detail: String?
+    var tint: Color?
+    var progress: Double?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text(title)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Text(value)
+                .font(.title3.weight(.semibold))
+                .monospacedDigit()
+                .foregroundStyle(tint ?? .primary)
+                .lineLimit(1)
+                .minimumScaleFactor(0.7)
+            if let progress {
+                ProgressView(value: progress)
+                    .tint(tint ?? .accentColor)
+                    .controlSize(.small)
+            }
+            if let detail {
+                Text(detail)
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+                    .lineLimit(1)
+            }
+        }
+        .padding(10)
+        .frame(maxWidth: .infinity, minHeight: 64, alignment: .topLeading)
+        .background(Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
     }
 }

@@ -46,7 +46,7 @@ enum CacheSyncMode: String, Codable, CaseIterable, Identifiable, Sendable {
 
     var title: String {
         switch self {
-        case .lazy: return "Lazy sync (on-demand when agent calls MCP)"
+        case .lazy: return "Lazy sync (caches what you or agents open)"
         case .rollingWindow: return "Rolling window (latest N messages)"
         case .timeWindow: return "Past X days"
         case .fullSync: return "Full mailbox sync"
@@ -68,9 +68,9 @@ enum AccountSyncScope: String, Codable, CaseIterable, Identifiable, Sendable {
 
     var title: String {
         switch self {
-        case .off: return "Off (lazy caching only)"
-        case .recent: return "Most recent messages"
-        case .days: return "Past X days"
+        case .off: return "Off (lazy sync only)"
+        case .recent: return "Recent X messages"
+        case .days: return "Recent X days"
         case .everything: return "Everything"
         }
     }
@@ -119,7 +119,7 @@ enum AccountSyncSchedule: String, Codable, CaseIterable, Identifiable, Sendable 
 }
 
 struct CacheSyncPolicy: Codable, Hashable, Sendable {
-    /// Global lazy-caching switch; per-account background sync works regardless.
+    /// Lazy sync is always on in the app; `false` is only used by tests to exercise the no-cache path.
     var enabled: Bool
     var mode: CacheSyncMode
     var rollingCount: Int
@@ -127,31 +127,32 @@ struct CacheSyncPolicy: Codable, Hashable, Sendable {
     var cooldownSeconds: Int
     var fullSyncBodies: Bool
     var dailyBandwidthCapMB: Int
-    /// 0 means unlimited.
-    var lazyCacheCapMB: Int
+    /// Global cache size limit in decimal megabytes (as Finder shows sizes). 0 means no limit.
+    /// Crossing it prompts the user; nothing is deleted automatically.
+    var cacheLimitMB: Int
     var pauseAutoSyncOnBattery: Bool
 
     static let `default` = CacheSyncPolicy(
         enabled: true,
         mode: .lazy,
-        rollingCount: 500,
+        rollingCount: 1000,
         daysBack: 90,
         cooldownSeconds: 60,
         fullSyncBodies: true,
         dailyBandwidthCapMB: 1500,
-        lazyCacheCapMB: 1024,
+        cacheLimitMB: 10_000,
         pauseAutoSyncOnBattery: true
     )
 
     init(
         enabled: Bool = true,
         mode: CacheSyncMode = .lazy,
-        rollingCount: Int = 500,
+        rollingCount: Int = 1000,
         daysBack: Int = 90,
         cooldownSeconds: Int = 60,
         fullSyncBodies: Bool = true,
         dailyBandwidthCapMB: Int = 1500,
-        lazyCacheCapMB: Int = 1024,
+        cacheLimitMB: Int = 10_000,
         pauseAutoSyncOnBattery: Bool = true
     ) {
         self.enabled = enabled
@@ -161,20 +162,23 @@ struct CacheSyncPolicy: Codable, Hashable, Sendable {
         self.cooldownSeconds = cooldownSeconds
         self.fullSyncBodies = fullSyncBodies
         self.dailyBandwidthCapMB = dailyBandwidthCapMB
-        self.lazyCacheCapMB = lazyCacheCapMB
+        self.cacheLimitMB = cacheLimitMB
         self.pauseAutoSyncOnBattery = pauseAutoSyncOnBattery
     }
 
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
-        enabled = try container.decodeIfPresent(Bool.self, forKey: .enabled) ?? true
+        enabled = true
         mode = try container.decodeIfPresent(CacheSyncMode.self, forKey: .mode) ?? .lazy
-        rollingCount = try container.decodeIfPresent(Int.self, forKey: .rollingCount) ?? 500
+        rollingCount = try container.decodeIfPresent(Int.self, forKey: .rollingCount) ?? 1000
         daysBack = try container.decodeIfPresent(Int.self, forKey: .daysBack) ?? 90
         cooldownSeconds = try container.decodeIfPresent(Int.self, forKey: .cooldownSeconds) ?? 60
         fullSyncBodies = try container.decodeIfPresent(Bool.self, forKey: .fullSyncBodies) ?? true
         dailyBandwidthCapMB = try container.decodeIfPresent(Int.self, forKey: .dailyBandwidthCapMB) ?? 1500
-        lazyCacheCapMB = try container.decodeIfPresent(Int.self, forKey: .lazyCacheCapMB) ?? 1024
+        let storedLimit = try container.decodeIfPresent(Int.self, forKey: .cacheLimitMB) ?? 10_000
+        // Early builds stored binary megabytes (10 GB = 10,240); map those presets to decimal.
+        let binaryPresets = [2048: 2_000, 5120: 5_000, 10_240: 10_000, 20_480: 20_000, 51_200: 50_000]
+        cacheLimitMB = binaryPresets[storedLimit] ?? storedLimit
         pauseAutoSyncOnBattery = try container.decodeIfPresent(Bool.self, forKey: .pauseAutoSyncOnBattery) ?? true
     }
 
@@ -182,8 +186,13 @@ struct CacheSyncPolicy: Codable, Hashable, Sendable {
 
     var cacheActive: Bool { enabled || mode.isProactive }
 
-    var lazyCacheCapBytes: Int64? {
-        lazyCacheCapMB > 0 ? Int64(lazyCacheCapMB) * 1_048_576 : nil
+    var cacheLimitBytes: Int64? {
+        cacheLimitMB > 0 ? Int64(cacheLimitMB) * 1_000_000 : nil
+    }
+
+    /// Recent and days windows always mirror bodies; Everything mirrors them when `fullSyncBodies` is on.
+    var downloadsBodies: Bool {
+        mode == .fullSync ? fullSyncBodies : mode.isProactive
     }
 
     var targetLimitPerFolder: Int {
@@ -296,6 +305,13 @@ struct MailAccount: Codable, Identifiable, Hashable, Sendable {
     var fullSyncBodies: Bool
     /// Lowercased sender addresses whose remote images load without asking.
     var trustedImageSenders: [String]
+    /// Bumped when default sync policy changes so older accounts can be migrated once (see docs/sync-retention.md).
+    var syncPolicyVersion: Int
+
+    static let currentSyncPolicyVersion = 2
+    static let defaultSyncScope: AccountSyncScope = .recent
+    static let defaultSyncRecentCount = 1000
+    static let defaultSyncSchedule: AccountSyncSchedule = .every30Minutes
 
     init(
         id: UUID = UUID(),
@@ -306,10 +322,10 @@ struct MailAccount: Codable, Identifiable, Hashable, Sendable {
         imap: IMAPSettings? = nil,
         lastError: String? = nil,
         createdAt: Date = Date(),
-        syncScope: AccountSyncScope = .off,
-        syncRecentCount: Int = 500,
+        syncScope: AccountSyncScope = MailAccount.defaultSyncScope,
+        syncRecentCount: Int = MailAccount.defaultSyncRecentCount,
         syncDaysBack: Int = 90,
-        syncSchedule: AccountSyncSchedule = .manual,
+        syncSchedule: AccountSyncSchedule = MailAccount.defaultSyncSchedule,
         fullSyncBodies: Bool = true,
         trustedImageSenders: [String] = []
     ) {
@@ -327,6 +343,7 @@ struct MailAccount: Codable, Identifiable, Hashable, Sendable {
         self.syncSchedule = syncSchedule
         self.fullSyncBodies = fullSyncBodies
         self.trustedImageSenders = trustedImageSenders
+        self.syncPolicyVersion = Self.currentSyncPolicyVersion
     }
 
     private enum LegacyCodingKeys: String, CodingKey {
@@ -359,6 +376,15 @@ struct MailAccount: Codable, Identifiable, Hashable, Sendable {
         syncSchedule = try container.decodeIfPresent(AccountSyncSchedule.self, forKey: .syncSchedule) ?? .manual
         fullSyncBodies = try container.decodeIfPresent(Bool.self, forKey: .fullSyncBodies) ?? true
         trustedImageSenders = try container.decodeIfPresent([String].self, forKey: .trustedImageSenders) ?? []
+        syncPolicyVersion = try container.decodeIfPresent(Int.self, forKey: .syncPolicyVersion) ?? 1
+        if syncPolicyVersion < 2 {
+            if syncScope == .off {
+                syncScope = Self.defaultSyncScope
+                syncRecentCount = Self.defaultSyncRecentCount
+                syncSchedule = Self.defaultSyncSchedule
+            }
+            syncPolicyVersion = Self.currentSyncPolicyVersion
+        }
     }
 }
 

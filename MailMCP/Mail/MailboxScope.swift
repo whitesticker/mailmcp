@@ -98,8 +98,8 @@ enum MailboxMatcher {
         if matches(last, ["trash", "deleted", "deleted items", "deleted messages", "bin"]) { return .trash }
         if lower.contains("all mail") || last == "all mail" { return .all }
         if matches(last, ["drafts", "draft"]) { return .drafts }
-        if last.contains("sent") { return .sent }
-        if last.contains("archive") { return .archive }
+        if matches(last, ["sent"]) { return .sent }
+        if matches(last, ["archive", "archives"]) { return .archive }
         return .other
     }
 
@@ -182,7 +182,13 @@ enum MailboxMatcher {
         }
     }
 
+    /// Whole-word match, so "Robinhood" is not "bin" and "Presentations" is not "sent".
     private static func matches(_ value: String, _ names: [String]) -> Bool {
-        names.contains { value == $0 || value.contains($0) }
+        let words = value.split { !$0.isLetter && !$0.isNumber }.map(String.init)
+        return names.contains { name in
+            let target = name.split { !$0.isLetter && !$0.isNumber }.map(String.init)
+            guard !target.isEmpty, words.count >= target.count else { return false }
+            return (0...(words.count - target.count)).contains { Array(words[$0..<$0 + target.count]) == target }
+        }
     }
 }

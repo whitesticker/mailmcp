@@ -25,10 +25,32 @@ struct MailMCPApp: App {
                     _ = OAuthBrowserFlow.handle(url: url)
                 }
         }
+        .commands {
+            SettingsCommands(appState: appState)
+        }
 
         MenuBarExtra("MailMCP", systemImage: appState.mcpAgentCount > 0 ? "envelope.fill" : "envelope") {
             MenuBarView()
                 .environmentObject(appState)
+        }
+    }
+}
+
+/// Replaces the default Settings… item so ⌘, opens the in-window Settings column.
+private struct SettingsCommands: Commands {
+    @ObservedObject var appState: AppState
+    @Environment(\.openWindow) private var openWindow
+
+    var body: some Commands {
+        CommandGroup(replacing: .appSettings) {
+            Button("Settings…") {
+                openWindow(id: "main")
+                NSApp.activate(ignoringOtherApps: true)
+                MailMCPAppDelegate.mainWindow()?.makeKeyAndOrderFront(nil)
+                appState.pendingSettingsOpen = true
+            }
+            .keyboardShortcut(",", modifiers: .command)
+            .disabled(!appState.isUnlocked)
         }
     }
 }
@@ -162,24 +184,20 @@ private struct LoginWindowGlass: ViewModifier {
     let success: Bool
 
     func body(content: Content) -> some View {
-        if #available(macOS 15.0, *) {
-            content
-                .containerBackground(for: .window) {
-                    if active {
-                        ZStack {
-                            BehindWindowBackdrop()
-                            Color.green
-                                .opacity(success ? 0.38 : 0)
-                                .animation(.easeInOut(duration: 0.3), value: success)
-                        }
-                    } else {
-                        Color(nsColor: .windowBackgroundColor)
+        content
+            .containerBackground(for: .window) {
+                if active {
+                    ZStack {
+                        BehindWindowBackdrop()
+                        Color.green
+                            .opacity(success ? 0.38 : 0)
+                            .animation(.easeInOut(duration: 0.3), value: success)
                     }
+                } else {
+                    Color(nsColor: .windowBackgroundColor)
                 }
-                .toolbarBackgroundVisibility(active ? .hidden : .automatic, for: .windowToolbar)
-        } else {
-            content
-        }
+            }
+            .toolbarBackgroundVisibility(active ? .hidden : .automatic, for: .windowToolbar)
     }
 }
 
@@ -244,6 +262,10 @@ struct RootView: View {
         }
         .sheet(item: $appState.pendingMerge) { _ in
             MergeVaultView()
+                .environmentObject(appState)
+        }
+        .sheet(isPresented: $appState.cacheLimitPromptVisible) {
+            CacheLimitSheet()
                 .environmentObject(appState)
         }
     }

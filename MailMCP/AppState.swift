@@ -58,6 +58,9 @@ final class AppState: ObservableObject {
     @Published var accountSyncProgress: [UUID: String] = [:]
     @Published var cacheRevision: Int = 0
     @Published var autoSyncPausedReason: String?
+    @Published var cacheLimitPromptVisible = false
+    /// Set by Settings… (⌘,); the main window consumes it and selects Settings.
+    @Published var pendingSettingsOpen = false
     @Published private var liveFolders: [UUID: [MailFolderCount]] = [:]
     private var folderRefreshDates: [UUID: Date] = [:]
 
@@ -791,6 +794,7 @@ final class AppState: ObservableObject {
     /// Starts at most one due mailbox per tick so mailboxes don't all hit the network at once.
     private func runAutoSyncTick() async {
         guard isUnlocked else { return }
+        checkCacheLimit()
         let scheduled = allUnlockedAccounts.filter { $0.syncScope != .off && $0.syncSchedule != .manual }
         guard !scheduled.isEmpty else {
             autoSyncPausedReason = nil
@@ -823,25 +827,49 @@ final class AppState: ObservableObject {
         }
     }
 
-    private func refreshProactiveAccounts() {
-        let ids = Set(allUnlockedAccounts.filter { $0.syncScope != .off }.map(\.id))
-        Task {
-            await MailboxSyncCoordinator.shared.setProactiveAccounts(ids)
-        }
-    }
+    // MARK: - Global cache limit (docs/sync-retention.md)
 
-    func lazyCacheSizeBytes() -> Int64 {
+    private static let cacheLimitRemindAfterKey = "cacheLimit.remindAfter"
+    private var lastCacheLimitCheck: Date?
+
+    func cacheUsedBytes() -> Int64 {
         _ = cacheRevision
-        let protected = Set(allUnlockedAccounts.filter { $0.syncScope != .off }.map(\.id))
-        return MailboxCacheStore.shared.lazyCacheSizeBytes(excluding: protected)
+        return MailboxCacheStore.shared.usedBytes()
     }
 
-    func trimLazyCacheNow() {
-        let policy = settings.cachePolicy
-        Task {
-            await MailboxSyncCoordinator.shared.enforceLazyCacheCap(policy: policy, store: .shared, force: true)
-            await MainActor.run { self.cacheRevision &+= 1 }
-        }
+    var isOverCacheLimit: Bool {
+        guard let limit = settings.cachePolicy.cacheLimitBytes else { return false }
+        return cacheUsedBytes() > limit
+    }
+
+    /// Shows the free-space prompt when the cache is over the limit, unless the user asked to be reminded later.
+    func checkCacheLimit(force: Bool = false) {
+        if !force, let last = lastCacheLimitCheck, Date().timeIntervalSince(last) < 120 { return }
+        lastCacheLimitCheck = Date()
+        guard isUnlocked, !cacheLimitPromptVisible,
+              let limit = settings.cachePolicy.cacheLimitBytes,
+              MailboxCacheStore.shared.usedBytes() > limit else { return }
+        let remindAfter = UserDefaults.standard.double(forKey: Self.cacheLimitRemindAfterKey)
+        if !force, remindAfter > Date().timeIntervalSince1970 { return }
+        cacheLimitPromptVisible = true
+    }
+
+    func remindAboutCacheLimitLater() {
+        UserDefaults.standard.set(Date().addingTimeInterval(86_400).timeIntervalSince1970, forKey: Self.cacheLimitRemindAfterKey)
+        cacheLimitPromptVisible = false
+    }
+
+    /// Deletes least-recently-used cached mail until about `bytes` are freed. Only runs on the user's request.
+    @discardableResult
+    func freeCacheSpace(bytes: Int64) async -> CacheFreeSpaceResult {
+        let result = await Task.detached(priority: .userInitiated) {
+            MailboxCacheStore.shared.freeSpace(bytes: bytes)
+        }.value
+        await MailboxSyncCoordinator.shared.resetCooldowns(for: result.accountIDs)
+        cacheRevision &+= 1
+        let freed = ByteCountFormatter.string(fromByteCount: result.bytesFreed, countStyle: .file)
+        statusMessage = "Freed \(freed) (\(result.messagesRemoved) cached messages)."
+        return result
     }
 
     func cacheStats(for account: MailAccount) -> AccountCacheStats {
@@ -1112,7 +1140,6 @@ final class AppState: ObservableObject {
         }
         startWatchers()
         consumePendingIMAPImportIfNeeded()
-        refreshProactiveAccounts()
         startAutoSyncScheduler()
     }
 
