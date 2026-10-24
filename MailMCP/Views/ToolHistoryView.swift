@@ -108,20 +108,6 @@ struct ToolHistoryView: View {
             }
         }
         .navigationTitle("Tool history")
-        .toolbar {
-            ToolbarItem(placement: .automatic) {
-                Button("History") {
-                    RecentCallsWindowController.shared.show(appState: appState)
-                }
-                .disabled(allCalls.isEmpty)
-            }
-            ToolbarItem(placement: .primaryAction) {
-                Button("Clear") {
-                    appState.clearMCPToolHistory()
-                }
-                .disabled(allCalls.isEmpty)
-            }
-        }
     }
 
     // MARK: - Persistence & Time Filter Card
@@ -135,25 +121,32 @@ struct ToolHistoryView: View {
         VStack(spacing: 12) {
             persistControlsContent
             Divider()
-            HStack(spacing: 12) {
-                Label("Time range", systemImage: "calendar.badge.clock")
-                    .font(.caption.weight(.medium))
-                    .foregroundStyle(.secondary)
-                Picker("Time range", selection: $timeRange) {
-                    ForEach(ToolHistoryTimeRange.allCases) { item in
-                        Text(item.rawValue).tag(item)
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: 12) {
+                    timeRangeLabel
+                    timeRangePicker
+                    Spacer(minLength: 8)
+                    rangeSummary(totalAllTime: totalAllTime, filteredCount: filteredCount)
+                    historyButtons
+                }
+                VStack(alignment: .leading, spacing: 10) {
+                    HStack(spacing: 12) {
+                        timeRangeLabel
+                        timeRangePicker
+                    }
+                    HStack(spacing: 12) {
+                        rangeSummary(totalAllTime: totalAllTime, filteredCount: filteredCount)
+                        Spacer(minLength: 8)
+                        historyButtons
                     }
                 }
-                .pickerStyle(.segmented)
-                .labelsHidden()
-                .frame(maxWidth: 340)
-
-                Spacer()
-
-                if timeRange != .all {
-                    Text("Showing \(filteredCount) of \(totalAllTime) calls")
-                        .font(.caption2.monospacedDigit())
-                        .foregroundStyle(.secondary)
+                VStack(alignment: .leading, spacing: 10) {
+                    timeRangePicker
+                    HStack(spacing: 12) {
+                        rangeSummary(totalAllTime: totalAllTime, filteredCount: filteredCount)
+                        Spacer(minLength: 8)
+                        historyButtons
+                    }
                 }
             }
         }
@@ -166,6 +159,48 @@ struct ToolHistoryView: View {
             RoundedRectangle(cornerRadius: 12, style: .continuous)
                 .strokeBorder(Color.primary.opacity(0.07), lineWidth: 1)
         )
+    }
+
+    private var timeRangeLabel: some View {
+        Label("Time range", systemImage: "calendar.badge.clock")
+            .font(.caption.weight(.medium))
+            .foregroundStyle(.secondary)
+            .fixedSize()
+    }
+
+    private var timeRangePicker: some View {
+        Picker("Time range", selection: $timeRange) {
+            ForEach(ToolHistoryTimeRange.allCases) { item in
+                Text(item.rawValue).tag(item)
+            }
+        }
+        .pickerStyle(.segmented)
+        .labelsHidden()
+        .fixedSize()
+    }
+
+    @ViewBuilder
+    private func rangeSummary(totalAllTime: Int, filteredCount: Int) -> some View {
+        if timeRange != .all {
+            Text("Showing \(filteredCount) of \(totalAllTime) calls")
+                .font(.caption2.monospacedDigit())
+                .foregroundStyle(.secondary)
+                .fixedSize()
+        }
+    }
+
+    @ViewBuilder
+    private var historyButtons: some View {
+        Button("Recent Calls…") {
+            RecentCallsWindowController.shared.show(appState: appState)
+        }
+        .fixedSize()
+        .help("Open the list of individual tool calls")
+        Button("Clear", role: .destructive) {
+            appState.clearMCPToolHistory()
+        }
+        .fixedSize()
+        .help("Delete all recorded tool calls")
     }
 
     private var persistControlsContent: some View {
@@ -664,44 +699,28 @@ struct RecentCallsPopoutView: View {
                     .frame(width: 150)
                 }
 
-                HStack(spacing: 12) {
-                    Picker("Time", selection: $timeRange) {
-                        ForEach(ToolHistoryTimeRange.allCases) { item in
-                            Text(item.rawValue).tag(item)
+                ViewThatFits(in: .horizontal) {
+                    HStack(spacing: 12) {
+                        filterPickers
+                        Spacer(minLength: 8)
+                        resultSummary(filtered: filtered, total: allCalls.count)
+                    }
+                    VStack(alignment: .leading, spacing: 8) {
+                        HStack(spacing: 12) {
+                            filterPickers
+                        }
+                        HStack(spacing: 12) {
+                            Spacer(minLength: 0)
+                            resultSummary(filtered: filtered, total: allCalls.count)
                         }
                     }
-                    .pickerStyle(.segmented)
-                    .labelsHidden()
-                    .frame(width: 280)
-
-                    Picker("Status", selection: $statusFilter) {
-                        ForEach(CallStatusFilter.allCases) { item in
-                            Text(item.rawValue).tag(item)
+                    VStack(alignment: .leading, spacing: 8) {
+                        timePicker
+                        HStack(spacing: 12) {
+                            statusPicker
+                            Spacer(minLength: 8)
+                            resultSummary(filtered: filtered, total: allCalls.count)
                         }
-                    }
-                    .pickerStyle(.segmented)
-                    .labelsHidden()
-                    .frame(width: 200)
-
-                    Spacer()
-
-                    Text("Showing \(filtered.count) of \(allCalls.count)")
-                        .font(.caption.monospacedDigit())
-                        .foregroundStyle(.secondary)
-
-                    if !filtered.isEmpty {
-                        Button(expandedCallIDs.isEmpty ? "Expand JSON" : "Collapse JSON") {
-                            if expandedCallIDs.isEmpty {
-                                for item in filtered.prefix(50) {
-                                    expandedCallIDs.insert(item.id)
-                                }
-                            } else {
-                                expandedCallIDs.removeAll()
-                            }
-                        }
-                        .buttonStyle(.plain)
-                        .font(.caption)
-                        .foregroundStyle(Color.accentColor)
                     }
                 }
             }
@@ -732,6 +751,58 @@ struct RecentCallsPopoutView: View {
             }
         }
         .frame(minWidth: 640, minHeight: 400)
+    }
+
+    @ViewBuilder
+    private var filterPickers: some View {
+        timePicker
+        statusPicker
+    }
+
+    private var timePicker: some View {
+        Picker("Time", selection: $timeRange) {
+            ForEach(ToolHistoryTimeRange.allCases) { item in
+                Text(item.rawValue).tag(item)
+            }
+        }
+        .pickerStyle(.segmented)
+        .labelsHidden()
+        .fixedSize()
+    }
+
+    private var statusPicker: some View {
+        Picker("Status", selection: $statusFilter) {
+            ForEach(CallStatusFilter.allCases) { item in
+                Text(item.rawValue).tag(item)
+            }
+        }
+        .pickerStyle(.segmented)
+        .labelsHidden()
+        .fixedSize()
+    }
+
+    @ViewBuilder
+    private func resultSummary(filtered: [MCPToolCallRecord], total: Int) -> some View {
+        Text("Showing \(filtered.count) of \(total)")
+            .font(.caption.monospacedDigit())
+            .foregroundStyle(.secondary)
+            .fixedSize()
+
+        if !filtered.isEmpty {
+            Button(expandedCallIDs.isEmpty ? "Expand JSON" : "Collapse JSON") {
+                if expandedCallIDs.isEmpty {
+                    for item in filtered.prefix(50) {
+                        expandedCallIDs.insert(item.id)
+                    }
+                } else {
+                    expandedCallIDs.removeAll()
+                }
+            }
+            .buttonStyle(.plain)
+            .font(.caption)
+            .foregroundStyle(Color.accentColor)
+            .fixedSize()
+        }
     }
 
     private func recentCallCard(_ call: MCPToolCallRecord) -> some View {

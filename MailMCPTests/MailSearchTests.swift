@@ -17,6 +17,14 @@ final class MailSearchTests: XCTestCase {
         XCTAssertNil(parsed.imapFolder)
     }
 
+    func testPreviewDropsRepeatedSubject() {
+        let subject = "Updates to Example App Terms of Service"
+        XCTAssertEqual(MailDisplayFormat.preview(snippet: "Updates to Example App  Terms of Service", subject: subject), "")
+        XCTAssertEqual(MailDisplayFormat.preview(snippet: "updates to example app terms of service — On November 5, we’re making changes!", subject: subject), "On November 5, we’re making changes!")
+        XCTAssertEqual(MailDisplayFormat.preview(snippet: "On November 5, we’re making changes.", subject: subject), "On November 5, we’re making changes.")
+        XCTAssertEqual(MailDisplayFormat.preview(snippet: "Hi there", subject: ""), "Hi there")
+    }
+
     func testFolderKindMatchesWholeWordsOnly() {
         XCTAssertEqual(MailboxMatcher.kind(ofName: "Robinhood"), .other)
         XCTAssertEqual(MailboxMatcher.kind(ofName: "Presentations"), .other)

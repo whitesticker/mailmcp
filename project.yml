@@ -30,8 +30,8 @@ targets:
         COMBINE_HIDPI_IMAGES: YES
         LD_RUNPATH_SEARCH_PATHS:
           - "@executable_path/../Frameworks"
-        MARKETING_VERSION: "1.4.0"
-        CURRENT_PROJECT_VERSION: "5"
+        MARKETING_VERSION: "1.5.0"
+        CURRENT_PROJECT_VERSION: "6"
         ENABLE_HARDENED_RUNTIME: NO
         SWIFT_STRICT_CONCURRENCY: minimal
         SWIFT_EMIT_LOC_STRINGS: NO

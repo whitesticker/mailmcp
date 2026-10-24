@@ -124,6 +124,23 @@ enum MailDisplayFormat {
         }
         return date.formatted(date: .numeric, time: .omitted)
     }
+
+    /// List preview text without a leading copy of the subject, which many senders repeat as the first line.
+    static func preview(snippet: String, subject: String) -> String {
+        let text = collapsed(snippet)
+        let title = collapsed(subject)
+        guard !title.isEmpty,
+              let range = text.range(of: title, options: [.caseInsensitive, .diacriticInsensitive, .anchored]) else {
+            return text
+        }
+        let rest = text[range.upperBound...].drop { " -–—:|·.!".contains($0) }
+        return rest.count < 3 ? "" : String(rest)
+    }
+
+    private static func collapsed(_ text: String) -> String {
+        text.replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
 }
 
 @MainActor
@@ -137,12 +154,21 @@ final class MailboxReaderModel: ObservableObject {
     let accountID: UUID
     let folder: String
 
-    @Published private(set) var messages: [MailSummary] = []
+    @Published private(set) var messages: [MailSummary] = [] {
+        didSet {
+            // Toolbar actions only act on listed rows, so a message that leaves the list (e.g. filtered out by search) closes too.
+            if let selectedID, !messages.contains(where: { $0.id == selectedID }) {
+                select(nil)
+            }
+        }
+    }
     @Published private(set) var selectedID: String?
     @Published private(set) var openMessage: MailMessage?
     @Published private(set) var isRefreshing = false
     @Published private(set) var isLoadingMore = false
     @Published private(set) var isLoadingMessage = false
+    /// Set once a message has taken long enough to load (usually a server fetch) that the reader should show it.
+    @Published private(set) var isLoadingSlowly = false
     @Published private(set) var reachedEnd = false
     @Published private(set) var hasLoadedOnce = false
     @Published private(set) var listError: String?
@@ -398,24 +424,35 @@ final class MailboxReaderModel: ObservableObject {
         guard let id else {
             openMessage = nil
             isLoadingMessage = false
+            isLoadingSlowly = false
             return
         }
-        openMessage = nil
+        // The previous message stays up until this one arrives so the reader (and its web view) isn't torn down per click.
         isLoadingMessage = true
+        isLoadingSlowly = false
         messageTask = Task { [weak self] in
             guard let self else { return }
+            let slowTimer = Task { [weak self] in
+                try? await Task.sleep(nanoseconds: 250_000_000)
+                guard !Task.isCancelled, let self, self.selectedID == id, self.isLoadingMessage else { return }
+                self.isLoadingSlowly = true
+            }
+            defer { slowTimer.cancel() }
             do {
                 let message = try await self.provider().getMessage(id: id)
                 try Task.checkCancellation()
                 self.openMessage = message
                 self.isLoadingMessage = false
+                self.isLoadingSlowly = false
                 if self.messages.first(where: { $0.id == id })?.isUnread ?? message.isUnread {
                     self.scheduleMarkRead(id)
                 }
             } catch {
                 if Task.isCancelled { return }
+                self.openMessage = nil
                 self.messageError = error.localizedDescription
                 self.isLoadingMessage = false
+                self.isLoadingSlowly = false
             }
         }
     }
@@ -469,9 +506,10 @@ final class MailboxReaderModel: ObservableObject {
     func remove(id: String?, _ removal: Removal) {
         guard let id, let index = messages.firstIndex(where: { $0.id == id }) else { return }
         let removed = messages[index]
+        let wasSelected = selectedID == id
         pendingRemovals.insert(id)
         messages.remove(at: index)
-        if selectedID == id {
+        if wasSelected {
             let next = messages.indices.contains(index) ? messages[index].id : messages.last?.id
             select(next)
         }
@@ -582,17 +620,15 @@ struct MailboxReaderView: View {
     @EnvironmentObject private var appState: AppState
     let account: MailAccount
     let folder: String
-    let onOpenSettings: () -> Void
     @StateObject private var model: MailboxReaderModel
     @AppStorage("reader.listColumnWidth") private var listWidth: Double = 340
 
     private static let listRange: ClosedRange<Double> = 240...600
     private static let readerMinWidth: Double = 300
 
-    init(account: MailAccount, folder: String, onOpenSettings: @escaping () -> Void) {
+    init(account: MailAccount, folder: String) {
         self.account = account
         self.folder = folder
-        self.onOpenSettings = onOpenSettings
         _model = StateObject(wrappedValue: MailboxReaderModel(accountID: account.id, folder: folder))
     }
 
@@ -610,7 +646,6 @@ struct MailboxReaderView: View {
             }
         }
         .navigationTitle(ReaderFolders.title(for: folder))
-        .navigationSubtitle(account.displayName.isEmpty ? account.email : account.displayName)
         .searchable(text: $model.searchText, placement: .toolbar, prompt: "Search \(ReaderFolders.title(for: folder))")
         .onSubmit(of: .search) { model.refresh() }
         .onChange(of: model.searchText) { _, _ in model.searchTextChanged() }
@@ -684,13 +719,6 @@ struct MailboxReaderView: View {
             }
             .help("Move to folder")
             .disabled(model.selectedSummary == nil)
-
-            Button {
-                onOpenSettings()
-            } label: {
-                Label("Mailbox Settings", systemImage: "info.circle")
-            }
-            .help("Mailbox settings and cache")
         }
     }
 }
@@ -875,9 +903,7 @@ private struct MessageRow: View {
     }
 
     private var snippet: String {
-        message.snippet
-            .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
-            .trimmingCharacters(in: .whitespacesAndNewlines)
+        MailDisplayFormat.preview(snippet: message.snippet, subject: message.subject)
     }
 }
 
@@ -887,6 +913,13 @@ private struct MessageReadingPane: View {
     var body: some View {
         if let message = model.openMessage {
             MessageDetail(message: message, model: model)
+                .opacity(model.isLoadingSlowly ? 0.35 : 1)
+                .overlay {
+                    if model.isLoadingSlowly {
+                        ProgressView()
+                    }
+                }
+                .animation(.easeInOut(duration: 0.15), value: model.isLoadingSlowly)
         } else if model.isLoadingMessage {
             ProgressView()
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -928,15 +961,7 @@ private struct MessageDetail: View {
             HStack(alignment: .top, spacing: 10) {
                 SenderAvatar(name: sender.name, email: sender.email)
                 VStack(alignment: .leading, spacing: 2) {
-                    HStack(spacing: 6) {
-                        Text(sender.name)
-                            .fontWeight(.semibold)
-                        if sender.name != sender.email {
-                            Text(sender.email)
-                                .foregroundStyle(.secondary)
-                        }
-                    }
-                    .lineLimit(1)
+                    senderLines(sender)
                     if !message.to.isEmpty {
                         recipientLine("To", message.to)
                     }
@@ -945,12 +970,7 @@ private struct MessageDetail: View {
                     }
                 }
                 .textSelection(.enabled)
-                Spacer(minLength: 8)
-                if let date = message.date {
-                    Text(date.formatted(date: .abbreviated, time: .shortened))
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
             if !message.attachments.isEmpty {
                 FlowLayout(spacing: 6) {
@@ -961,6 +981,38 @@ private struct MessageDetail: View {
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    /// Widest layout that fits: name, address and date on one line; then the date beside the name; then one line each, with the address truncating first.
+    private func senderLines(_ sender: (name: String, email: String)) -> some View {
+        let showsEmail = sender.name != sender.email
+        let name = Text(sender.name).fontWeight(.semibold)
+        let email = Text(sender.email).foregroundStyle(.secondary)
+        let date = Text(message.date?.formatted(date: .abbreviated, time: .shortened) ?? "")
+            .font(.caption)
+            .foregroundStyle(.secondary)
+        return ViewThatFits(in: .horizontal) {
+            HStack(alignment: .firstTextBaseline, spacing: 6) {
+                name
+                if showsEmail { email }
+                Spacer(minLength: 8)
+                date
+            }
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    name
+                    Spacer(minLength: 8)
+                    date
+                }
+                if showsEmail { email.lineLimit(1).truncationMode(.middle) }
+            }
+            VStack(alignment: .leading, spacing: 2) {
+                name.lineLimit(1)
+                if showsEmail { email.lineLimit(1).truncationMode(.middle) }
+                date
+            }
+        }
+        .help(showsEmail ? "\(sender.name) <\(sender.email)>" : sender.email)
     }
 
     private func recipientLine(_ label: String, _ addresses: [String]) -> some View {
@@ -991,23 +1043,47 @@ private struct MessageDetail: View {
     }
 
     private var remoteContentBanner: some View {
-        HStack(spacing: 8) {
+        ViewThatFits(in: .horizontal) {
+            HStack(spacing: 8) {
+                remoteContentNotice
+                    .frame(minWidth: 220, idealWidth: 300, maxWidth: .infinity, alignment: .leading)
+                remoteContentButtons
+            }
+            VStack(alignment: .leading, spacing: 6) {
+                remoteContentNotice
+                HStack(spacing: 8) {
+                    remoteContentButtons
+                }
+                .padding(.leading, 24)
+            }
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 8)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.yellow.opacity(0.12))
+    }
+
+    private var remoteContentNotice: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
             Image(systemName: "eye.slash")
                 .foregroundStyle(.secondary)
+                .frame(width: 16)
             Text("Remote images are blocked so the sender can’t tell when you open this message.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
-            Spacer(minLength: 8)
-            Button("Load Images") { model.loadRemoteContent(for: message) }
-                .controlSize(.small)
-            Button("Always from Sender") { model.trustSender(of: message) }
-                .controlSize(.small)
-                .help("Always load remote images from \(MailDisplayFormat.address(message.from).email)")
         }
-        .padding(.horizontal, 16)
-        .padding(.vertical, 8)
-        .background(Color.yellow.opacity(0.12))
+    }
+
+    @ViewBuilder
+    private var remoteContentButtons: some View {
+        Button("Load Images") { model.loadRemoteContent(for: message) }
+            .controlSize(.small)
+            .fixedSize()
+        Button("Always from Sender") { model.trustSender(of: message) }
+            .controlSize(.small)
+            .fixedSize()
+            .help("Always load remote images from \(MailDisplayFormat.address(message.from).email)")
     }
 }
 

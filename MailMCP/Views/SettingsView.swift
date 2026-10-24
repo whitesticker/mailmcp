@@ -32,77 +32,52 @@ enum SettingsPane: String, CaseIterable, Identifiable {
     }
 }
 
-/// Settings with a secondary list column, laid out like a mailbox's folder column.
-struct SettingsWorkspaceView: View {
-    enum Item: Hashable {
-        case addAccount
-        case addVault
-        case agents
-        case history
-        case pane(SettingsPane)
-    }
+enum SettingsItem: Hashable {
+    case addAccount
+    case addVault
+    case agents
+    case history
+    case pane(SettingsPane)
+}
 
-    @EnvironmentObject private var appState: AppState
-    @State private var item: Item
-    @AppStorage("reader.folderColumnWidth") private var listWidth: Double = 200
-
-    private static let listRange: ClosedRange<Double> = 150...320
-    private static let contentMinWidth: Double = 560
-
-    init(initialItem: Item = .pane(.safety)) {
-        _item = State(initialValue: initialItem)
-    }
+/// The settings list, shown in the window's middle column.
+struct SettingsItemList: View {
+    @Binding var item: SettingsItem
 
     var body: some View {
-        GeometryReader { geometry in
-            let available = Double(geometry.size.width) - Double(ColumnResizeHandle.hitWidth)
-            let width = max(Self.listRange.lowerBound, min(listWidth, available - Self.contentMinWidth))
-            HStack(spacing: 0) {
-                list
-                    .frame(width: width)
-                ColumnResizeHandle(width: $listWidth, range: Self.listRange)
-                content
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-            }
-        }
-        .toolbar(removing: .title)
-    }
-
-    private var list: some View {
         VStack(spacing: 0) {
-            ColumnTitle(text: "Settings")
-            itemList
+            List(selection: Binding(get: { item }, set: { if let value = $0 { item = value } })) {
+                Section("Add") {
+                    Label("Add an Account", systemImage: "envelope.badge.plus")
+                        .tag(SettingsItem.addAccount)
+                    Label("Add a Vault", systemImage: "externaldrive.badge.plus")
+                        .tag(SettingsItem.addVault)
+                    Label("Add to an Agent", systemImage: "puzzlepiece.extension")
+                        .tag(SettingsItem.agents)
+                }
+                Section("Activity") {
+                    Label("Tool History", systemImage: "clock.arrow.circlepath")
+                        .tag(SettingsItem.history)
+                }
+                Section("Settings") {
+                    ForEach(SettingsPane.allCases) { pane in
+                        Label(pane.title, systemImage: pane.icon)
+                            .tag(SettingsItem.pane(pane))
+                    }
+                }
+            }
+            .listStyle(.sidebar)
+            .scrollContentBackground(.hidden)
         }
         .background(Color(nsColor: .controlBackgroundColor))
     }
+}
 
-    private var itemList: some View {
-        List(selection: Binding(get: { item }, set: { if let value = $0 { item = value } })) {
-            Section("Add") {
-                Label("Add an Account", systemImage: "envelope.badge.plus")
-                    .tag(Item.addAccount)
-                Label("Add a Vault", systemImage: "externaldrive.badge.plus")
-                    .tag(Item.addVault)
-                Label("Add to an Agent", systemImage: "puzzlepiece.extension")
-                    .tag(Item.agents)
-            }
-            Section("Activity") {
-                Label("Tool History", systemImage: "clock.arrow.circlepath")
-                    .tag(Item.history)
-            }
-            Section("Settings") {
-                ForEach(SettingsPane.allCases) { pane in
-                    Label(pane.title, systemImage: pane.icon)
-                        .tag(Item.pane(pane))
-                }
-            }
-        }
-        .listStyle(.sidebar)
-        .scrollContentBackground(.hidden)
-    }
+/// The selected settings item, shown in the window's detail column.
+struct SettingsItemDetail: View {
+    let item: SettingsItem
 
-    @ViewBuilder
-    private var content: some View {
+    var body: some View {
         switch item {
         case .addAccount:
             AddAccountView(inline: true)
@@ -567,6 +542,8 @@ struct SettingsView: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
         }
+        .accessibilityLabel(tool.title)
+        .accessibilityHint(tool.intro)
     }
 
     private var safetyBinding: Binding<SafetyMode> {

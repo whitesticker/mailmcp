@@ -61,12 +61,19 @@ final class MailboxCacheStore: @unchecked Sendable {
 
     private let lock = NSLock()
     private var db: OpaquePointer?
+    /// Separate read-only connection so the UI never waits behind a sync write transaction (WAL lets readers run alongside the writer).
+    private let readLock = NSLock()
+    private var readDB: OpaquePointer?
+    private let touchQueue = DispatchQueue(label: "MailMCP.cache.touch", qos: .utility)
+    private let notifyLock = NSLock()
+    private var notifyPending = false
 
     init(directoryURL: URL) {
         self.directoryURL = directoryURL
         self.databaseURL = directoryURL.appendingPathComponent("envelope-index.sqlite")
         self.attachmentsDirectoryURL = directoryURL.appendingPathComponent("attachments", isDirectory: true)
         openAndMigrate()
+        openReader()
     }
 
     deinit {
@@ -74,12 +81,58 @@ final class MailboxCacheStore: @unchecked Sendable {
     }
 
     func close() {
+        readLock.lock()
+        if let reader = readDB {
+            sqlite3_close(reader)
+            readDB = nil
+        }
+        readLock.unlock()
         lock.lock()
         if let current = db {
             sqlite3_close(current)
             db = nil
         }
         lock.unlock()
+    }
+
+    private func openReader() {
+        lock.lock()
+        let ready = db != nil
+        lock.unlock()
+        guard ready else { return }
+        var handle: OpaquePointer?
+        guard sqlite3_open_v2(databaseURL.path, &handle, SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX, nil) == SQLITE_OK,
+              let handle else {
+            if let handle { sqlite3_close(handle) }
+            return
+        }
+        readLock.lock()
+        readDB = handle
+        readLock.unlock()
+    }
+
+    /// Runs a read on the reader connection, or on the writer (under its lock) if the reader couldn't be opened.
+    private func read<T>(_ fallback: T, _ body: (OpaquePointer) -> T) -> T {
+        readLock.lock()
+        if let readDB {
+            defer { readLock.unlock() }
+            return body(readDB)
+        }
+        readLock.unlock()
+        lock.lock()
+        defer { lock.unlock() }
+        guard let db else { return fallback }
+        return body(db)
+    }
+
+    private func touchMessage(accountID: String, messageID: String) {
+        touchQueue.async { [weak self] in
+            guard let self else { return }
+            self.lock.lock()
+            defer { self.lock.unlock() }
+            guard let db = self.db else { return }
+            self.touchMessageLocked(accountID: accountID, messageID: messageID, on: db)
+        }
     }
 
     // MARK: - Folders & Watermarks
@@ -124,53 +177,51 @@ final class MailboxCacheStore: @unchecked Sendable {
     }
 
     func cachedFolders(accountID: UUID) -> [CachedFolderRecord] {
-        lock.lock()
-        defer { lock.unlock() }
-        guard let db else { return [] }
+        read([]) { db in
+            let sql = """
+            SELECT name, remote_id, kind, selectable, messages, unseen, watermark,
+                   synced_count, oldest_synced_at, is_fully_synced, last_synced_at
+            FROM folders
+            WHERE account_id = ?1
+            ORDER BY name COLLATE NOCASE ASC;
+            """
+            var stmt: OpaquePointer?
+            guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK, let stmt else { return [] }
+            defer { sqlite3_finalize(stmt) }
+            bindText(stmt, index: 1, accountID.uuidString)
 
-        let sql = """
-        SELECT name, remote_id, kind, selectable, messages, unseen, watermark,
-               synced_count, oldest_synced_at, is_fully_synced, last_synced_at
-        FROM folders
-        WHERE account_id = ?1
-        ORDER BY name COLLATE NOCASE ASC;
-        """
-        var stmt: OpaquePointer?
-        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK, let stmt else { return [] }
-        defer { sqlite3_finalize(stmt) }
-        bindText(stmt, index: 1, accountID.uuidString)
-
-        var rows: [CachedFolderRecord] = []
-        while sqlite3_step(stmt) == SQLITE_ROW {
-            let name = columnText(stmt, 0) ?? ""
-            let remoteID = columnText(stmt, 1)
-            let kind = columnText(stmt, 2) ?? MailboxKind.other.rawValue
-            let selectable = sqlite3_column_int(stmt, 3) != 0
-            let messages = columnOptionalInt(stmt, 4)
-            let unseen = columnOptionalInt(stmt, 5)
-            let watermark = columnText(stmt, 6)
-            let syncedCount = Int(sqlite3_column_int(stmt, 7))
-            let oldestSyncedAt = columnOptionalDate(stmt, 8)
-            let isFullySynced = sqlite3_column_int(stmt, 9) != 0
-            let lastSyncedAt = columnOptionalDate(stmt, 10)
-            rows.append(
-                CachedFolderRecord(
-                    accountID: accountID,
-                    name: name,
-                    remoteID: remoteID,
-                    kind: kind,
-                    selectable: selectable,
-                    messages: messages,
-                    unseen: unseen,
-                    watermark: watermark,
-                    syncedCount: syncedCount,
-                    oldestSyncedAt: oldestSyncedAt,
-                    isFullySynced: isFullySynced,
-                    lastSyncedAt: lastSyncedAt
+            var rows: [CachedFolderRecord] = []
+            while sqlite3_step(stmt) == SQLITE_ROW {
+                let name = columnText(stmt, 0) ?? ""
+                let remoteID = columnText(stmt, 1)
+                let kind = columnText(stmt, 2) ?? MailboxKind.other.rawValue
+                let selectable = sqlite3_column_int(stmt, 3) != 0
+                let messages = columnOptionalInt(stmt, 4)
+                let unseen = columnOptionalInt(stmt, 5)
+                let watermark = columnText(stmt, 6)
+                let syncedCount = Int(sqlite3_column_int(stmt, 7))
+                let oldestSyncedAt = columnOptionalDate(stmt, 8)
+                let isFullySynced = sqlite3_column_int(stmt, 9) != 0
+                let lastSyncedAt = columnOptionalDate(stmt, 10)
+                rows.append(
+                    CachedFolderRecord(
+                        accountID: accountID,
+                        name: name,
+                        remoteID: remoteID,
+                        kind: kind,
+                        selectable: selectable,
+                        messages: messages,
+                        unseen: unseen,
+                        watermark: watermark,
+                        syncedCount: syncedCount,
+                        oldestSyncedAt: oldestSyncedAt,
+                        isFullySynced: isFullySynced,
+                        lastSyncedAt: lastSyncedAt
+                    )
                 )
-            )
+            }
+            return rows
         }
-        return rows
     }
 
     func updateFolderSyncState(
@@ -220,21 +271,19 @@ final class MailboxCacheStore: @unchecked Sendable {
     }
 
     func accountWatermark(accountID: UUID) -> (watermark: String?, lastCheckedAt: Date?, lastSyncedAt: Date?) {
-        lock.lock()
-        defer { lock.unlock() }
-        guard let db else { return (nil, nil, nil) }
-
-        let sql = "SELECT watermark, last_checked_at, last_synced_at FROM account_sync_state WHERE account_id = ?1;"
-        var stmt: OpaquePointer?
-        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK, let stmt else { return (nil, nil, nil) }
-        defer { sqlite3_finalize(stmt) }
-        bindText(stmt, index: 1, accountID.uuidString)
-        guard sqlite3_step(stmt) == SQLITE_ROW else { return (nil, nil, nil) }
-        return (
-            columnText(stmt, 0),
-            columnOptionalDate(stmt, 1),
-            columnOptionalDate(stmt, 2)
-        )
+        read((nil, nil, nil)) { db in
+            let sql = "SELECT watermark, last_checked_at, last_synced_at FROM account_sync_state WHERE account_id = ?1;"
+            var stmt: OpaquePointer?
+            guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK, let stmt else { return (nil, nil, nil) }
+            defer { sqlite3_finalize(stmt) }
+            bindText(stmt, index: 1, accountID.uuidString)
+            guard sqlite3_step(stmt) == SQLITE_ROW else { return (nil, nil, nil) }
+            return (
+                columnText(stmt, 0),
+                columnOptionalDate(stmt, 1),
+                columnOptionalDate(stmt, 2)
+            )
+        }
     }
 
     func saveAccountWatermark(accountID: UUID, watermark: String?, checkedAt: Date = Date(), syncedAt: Date? = nil) {
@@ -428,10 +477,9 @@ final class MailboxCacheStore: @unchecked Sendable {
     }
 
     func dailyBandwidthBytes(accountID: UUID) -> Int64 {
-        lock.lock()
-        defer { lock.unlock() }
-        guard let db else { return 0 }
-        return dailyBandwidthBytesLocked(accountID: accountID.uuidString, on: db)
+        read(0) { db in
+            return dailyBandwidthBytesLocked(accountID: accountID.uuidString, on: db)
+        }
     }
 
     private func dailyBandwidthBytesLocked(accountID: String, on db: OpaquePointer) -> Int64 {
@@ -455,67 +503,65 @@ final class MailboxCacheStore: @unchecked Sendable {
     }
 
     func getMessage(accountID: UUID, id: String) -> MailMessage? {
-        lock.lock()
-        defer { lock.unlock() }
-        guard let db else { return nil }
+        read(nil) { db in
+            let sql = """
+            SELECT m.message_id, m.account_email, m.thread_id, m.from_addr, m.to_json,
+                   m.cc_json, m.bcc_json, m.subject, m.date_ts, m.is_unread, m.labels_json,
+                   m.mailbox, m.mailbox_kind, b.body_text, b.body_html, b.attachments_json
+            FROM messages m
+            INNER JOIN message_bodies b
+                ON m.account_id = b.account_id AND m.message_id = b.message_id
+            WHERE m.account_id = ?1 AND (m.message_id = ?2 OR m.native_id = ?3)
+            LIMIT 1;
+            """
+            var stmt: OpaquePointer?
+            guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK, let stmt else { return nil }
+            defer { sqlite3_finalize(stmt) }
+            let nativeID = MessageLocator.parse(id).nativeID
+            bindText(stmt, index: 1, accountID.uuidString)
+            bindText(stmt, index: 2, id)
+            bindText(stmt, index: 3, nativeID)
 
-        let sql = """
-        SELECT m.message_id, m.account_email, m.thread_id, m.from_addr, m.to_json,
-               m.cc_json, m.bcc_json, m.subject, m.date_ts, m.is_unread, m.labels_json,
-               m.mailbox, m.mailbox_kind, b.body_text, b.body_html, b.attachments_json
-        FROM messages m
-        INNER JOIN message_bodies b
-            ON m.account_id = b.account_id AND m.message_id = b.message_id
-        WHERE m.account_id = ?1 AND (m.message_id = ?2 OR m.native_id = ?3)
-        LIMIT 1;
-        """
-        var stmt: OpaquePointer?
-        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK, let stmt else { return nil }
-        defer { sqlite3_finalize(stmt) }
-        let nativeID = MessageLocator.parse(id).nativeID
-        bindText(stmt, index: 1, accountID.uuidString)
-        bindText(stmt, index: 2, id)
-        bindText(stmt, index: 3, nativeID)
+            guard sqlite3_step(stmt) == SQLITE_ROW else { return nil }
+            let messageID = columnText(stmt, 0) ?? id
+            touchMessage(accountID: accountID.uuidString, messageID: messageID)
+            let accountEmail = columnText(stmt, 1) ?? ""
+            let threadID = columnText(stmt, 2)
+            let from = columnText(stmt, 3) ?? ""
+            let to = decodeStringArray(columnText(stmt, 4))
+            let cc = decodeStringArray(columnText(stmt, 5))
+            let bcc = decodeStringArray(columnText(stmt, 6))
+            let subject = columnText(stmt, 7) ?? "(no subject)"
+            let date = columnOptionalDate(stmt, 8)
+            let isUnread = sqlite3_column_int(stmt, 9) != 0
+            let labels = decodeStringArray(columnText(stmt, 10))
+            let mailbox = columnText(stmt, 11)
+            let mailboxKind = columnText(stmt, 12)
+            let bodyText = columnText(stmt, 13) ?? ""
+            let bodyHTML = columnText(stmt, 14)
+            let attachmentsJSON = columnText(stmt, 15) ?? "[]"
+            let attachments = (try? JSONCoders.decoder.decode([MailAttachmentMeta].self, from: Data(attachmentsJSON.utf8))) ?? []
 
-        guard sqlite3_step(stmt) == SQLITE_ROW else { return nil }
-        let messageID = columnText(stmt, 0) ?? id
-        touchMessageLocked(accountID: accountID.uuidString, messageID: messageID, on: db)
-        let accountEmail = columnText(stmt, 1) ?? ""
-        let threadID = columnText(stmt, 2)
-        let from = columnText(stmt, 3) ?? ""
-        let to = decodeStringArray(columnText(stmt, 4))
-        let cc = decodeStringArray(columnText(stmt, 5))
-        let bcc = decodeStringArray(columnText(stmt, 6))
-        let subject = columnText(stmt, 7) ?? "(no subject)"
-        let date = columnOptionalDate(stmt, 8)
-        let isUnread = sqlite3_column_int(stmt, 9) != 0
-        let labels = decodeStringArray(columnText(stmt, 10))
-        let mailbox = columnText(stmt, 11)
-        let mailboxKind = columnText(stmt, 12)
-        let bodyText = columnText(stmt, 13) ?? ""
-        let bodyHTML = columnText(stmt, 14)
-        let attachmentsJSON = columnText(stmt, 15) ?? "[]"
-        let attachments = (try? JSONCoders.decoder.decode([MailAttachmentMeta].self, from: Data(attachmentsJSON.utf8))) ?? []
-
-        return MailMessage(
-            id: messageID,
-            accountID: accountID,
-            accountEmail: accountEmail,
-            threadID: threadID,
-            from: from,
-            to: to,
-            cc: cc,
-            bcc: bcc,
-            subject: subject,
-            date: date,
-            body: bodyText,
-            bodyHTML: bodyHTML,
-            isUnread: isUnread,
-            labels: labels,
-            attachments: attachments,
-            mailbox: mailbox,
-            mailboxKind: mailboxKind
-        )
+            return MailMessage(
+                id: messageID,
+                accountID: accountID,
+                accountEmail: accountEmail,
+                threadID: threadID,
+                from: from,
+                to: to,
+                cc: cc,
+                bcc: bcc,
+                subject: subject,
+                date: date,
+                body: bodyText,
+                bodyHTML: bodyHTML,
+                isUnread: isUnread,
+                labels: labels,
+                attachments: attachments,
+                mailbox: mailbox,
+                mailboxKind: mailboxKind
+            )
+        }
     }
 
     // MARK: - Local Search
@@ -528,140 +574,136 @@ final class MailboxCacheStore: @unchecked Sendable {
         before: Date?,
         limit: Int
     ) -> [MailSummary] {
-        lock.lock()
-        defer { lock.unlock() }
-        guard let db else { return [] }
+        read([]) { db in
+            let parsed = ParsedCacheQuery.parse(query)
+            var clauses: [String] = ["m.account_id = ?"]
+            var bindings: [SQLBindValue] = [.text(accountID.uuidString)]
 
-        let parsed = ParsedCacheQuery.parse(query)
-        var clauses: [String] = ["m.account_id = ?"]
-        var bindings: [SQLBindValue] = [.text(accountID.uuidString)]
+            if let mailboxes, !mailboxes.isEmpty {
+                let nonAnywhere = mailboxes.filter { $0.lowercased() != "anywhere" && $0.lowercased() != "everywhere" }
+                if !nonAnywhere.isEmpty {
+                    var subClauses: [String] = []
+                    for box in nonAnywhere {
+                        let kind = MailboxMatcher.kind(ofName: box).rawValue
+                        if kind != MailboxKind.other.rawValue {
+                            subClauses.append("(LOWER(m.mailbox) = LOWER(?) OR LOWER(m.mailbox_kind) = LOWER(?))")
+                            bindings.append(.text(box))
+                            bindings.append(.text(kind))
+                        } else {
+                            subClauses.append("LOWER(m.mailbox) = LOWER(?)")
+                            bindings.append(.text(box))
+                        }
+                    }
+                    clauses.append("(" + subClauses.joined(separator: " OR ") + ")")
+                }
+            }
 
-        if let mailboxes, !mailboxes.isEmpty {
-            let nonAnywhere = mailboxes.filter { $0.lowercased() != "anywhere" && $0.lowercased() != "everywhere" }
-            if !nonAnywhere.isEmpty {
-                var subClauses: [String] = []
-                for box in nonAnywhere {
-                    let kind = MailboxMatcher.kind(ofName: box).rawValue
-                    if kind != MailboxKind.other.rawValue {
-                        subClauses.append("(LOWER(m.mailbox) = LOWER(?) OR LOWER(m.mailbox_kind) = LOWER(?))")
-                        bindings.append(.text(box))
-                        bindings.append(.text(kind))
-                    } else {
-                        subClauses.append("LOWER(m.mailbox) = LOWER(?)")
-                        bindings.append(.text(box))
+            if let unreadOnly = parsed.unreadOnly {
+                clauses.append("m.is_unread = ?")
+                bindings.append(.int(unreadOnly ? 1 : 0))
+            }
+
+            for fromFilter in parsed.fromTokens {
+                clauses.append("LOWER(m.from_addr) LIKE ?")
+                bindings.append(.text("%\(fromFilter.lowercased())%"))
+            }
+
+            for toFilter in parsed.toTokens {
+                clauses.append("LOWER(m.to_json) LIKE ?")
+                bindings.append(.text("%\(toFilter.lowercased())%"))
+            }
+
+            for subjectFilter in parsed.subjectTokens {
+                clauses.append("LOWER(m.subject) LIKE ?")
+                bindings.append(.text("%\(subjectFilter.lowercased())%"))
+            }
+
+            if let after {
+                clauses.append("m.date_ts >= ?")
+                bindings.append(.double(after.timeIntervalSince1970))
+            }
+            if let before {
+                clauses.append("m.date_ts < ?")
+                bindings.append(.double(before.timeIntervalSince1970))
+            }
+
+            var joinFTS = ""
+            if !parsed.textTokens.isEmpty {
+                if let ftsExpr = Self.makeFTSExpression(parsed.textTokens) {
+                    joinFTS = "INNER JOIN messages_fts fts ON fts.rowid = m.rowid"
+                    clauses.append("messages_fts MATCH ?")
+                    bindings.append(.text(ftsExpr))
+                } else {
+                    for token in parsed.textTokens {
+                        clauses.append("(LOWER(m.subject) LIKE ? OR LOWER(m.snippet) LIKE ? OR LOWER(m.from_addr) LIKE ?)")
+                        let pat = "%\(token.lowercased())%"
+                        bindings.append(.text(pat))
+                        bindings.append(.text(pat))
+                        bindings.append(.text(pat))
                     }
                 }
-                clauses.append("(" + subClauses.joined(separator: " OR ") + ")")
             }
-        }
 
-        if let unreadOnly = parsed.unreadOnly {
-            clauses.append("m.is_unread = ?")
-            bindings.append(.int(unreadOnly ? 1 : 0))
-        }
+            let cap = max(limit, 1)
+            let sql = """
+            SELECT m.message_id, m.account_email, m.thread_id, m.from_addr, m.to_json,
+                   m.subject, m.date_ts, m.snippet, m.is_unread, m.labels_json,
+                   m.mailbox, m.mailbox_kind
+            FROM messages m
+            \(joinFTS)
+            WHERE \(clauses.joined(separator: " AND "))
+            ORDER BY COALESCE(m.date_ts, 0) DESC
+            LIMIT \(cap);
+            """
 
-        for fromFilter in parsed.fromTokens {
-            clauses.append("LOWER(m.from_addr) LIKE ?")
-            bindings.append(.text("%\(fromFilter.lowercased())%"))
-        }
+            var stmt: OpaquePointer?
+            if sqlite3_prepare_v2(db, sql, -1, &stmt, nil) != SQLITE_OK || stmt == nil {
+                // Fallback to LIKE if FTS syntax rejected a query token
+                return searchWithLikeFallbackLocked(
+                    accountID: accountID,
+                    mailboxes: mailboxes,
+                    parsed: parsed,
+                    after: after,
+                    before: before,
+                    limit: cap,
+                    on: db
+                )
+            }
+            guard let stmt else { return [] }
+            defer { sqlite3_finalize(stmt) }
 
-        for toFilter in parsed.toTokens {
-            clauses.append("LOWER(m.to_json) LIKE ?")
-            bindings.append(.text("%\(toFilter.lowercased())%"))
-        }
-
-        for subjectFilter in parsed.subjectTokens {
-            clauses.append("LOWER(m.subject) LIKE ?")
-            bindings.append(.text("%\(subjectFilter.lowercased())%"))
-        }
-
-        if let after {
-            clauses.append("m.date_ts >= ?")
-            bindings.append(.double(after.timeIntervalSince1970))
-        }
-        if let before {
-            clauses.append("m.date_ts < ?")
-            bindings.append(.double(before.timeIntervalSince1970))
-        }
-
-        var joinFTS = ""
-        if !parsed.textTokens.isEmpty {
-            if let ftsExpr = Self.makeFTSExpression(parsed.textTokens) {
-                joinFTS = "INNER JOIN messages_fts fts ON fts.rowid = m.rowid"
-                clauses.append("messages_fts MATCH ?")
-                bindings.append(.text(ftsExpr))
-            } else {
-                for token in parsed.textTokens {
-                    clauses.append("(LOWER(m.subject) LIKE ? OR LOWER(m.snippet) LIKE ? OR LOWER(m.from_addr) LIKE ?)")
-                    let pat = "%\(token.lowercased())%"
-                    bindings.append(.text(pat))
-                    bindings.append(.text(pat))
-                    bindings.append(.text(pat))
+            for (idx, value) in bindings.enumerated() {
+                let pos = Int32(idx + 1)
+                switch value {
+                case .text(let s): bindText(stmt, index: pos, s)
+                case .int(let i): sqlite3_bind_int(stmt, pos, Int32(i))
+                case .double(let d): sqlite3_bind_double(stmt, pos, d)
                 }
             }
+
+            return collectSummariesLocked(stmt: stmt, accountID: accountID)
         }
-
-        let cap = max(limit, 1)
-        let sql = """
-        SELECT m.message_id, m.account_email, m.thread_id, m.from_addr, m.to_json,
-               m.subject, m.date_ts, m.snippet, m.is_unread, m.labels_json,
-               m.mailbox, m.mailbox_kind
-        FROM messages m
-        \(joinFTS)
-        WHERE \(clauses.joined(separator: " AND "))
-        ORDER BY COALESCE(m.date_ts, 0) DESC
-        LIMIT \(cap);
-        """
-
-        var stmt: OpaquePointer?
-        if sqlite3_prepare_v2(db, sql, -1, &stmt, nil) != SQLITE_OK || stmt == nil {
-            // Fallback to LIKE if FTS syntax rejected a query token
-            return searchWithLikeFallbackLocked(
-                accountID: accountID,
-                mailboxes: mailboxes,
-                parsed: parsed,
-                after: after,
-                before: before,
-                limit: cap,
-                on: db
-            )
-        }
-        guard let stmt else { return [] }
-        defer { sqlite3_finalize(stmt) }
-
-        for (idx, value) in bindings.enumerated() {
-            let pos = Int32(idx + 1)
-            switch value {
-            case .text(let s): bindText(stmt, index: pos, s)
-            case .int(let i): sqlite3_bind_int(stmt, pos, Int32(i))
-            case .double(let d): sqlite3_bind_double(stmt, pos, d)
-            }
-        }
-
-        return collectSummariesLocked(stmt: stmt, accountID: accountID)
     }
 
     func messageCount(accountID: UUID, mailbox: String = "INBOX", unreadOnly: Bool = false) -> Int? {
-        lock.lock()
-        defer { lock.unlock() }
-        guard let db else { return nil }
-
-        let kind = MailboxMatcher.kind(ofName: mailbox).rawValue
-        var sql = """
-        SELECT COUNT(*) FROM messages
-        WHERE account_id = ?1 AND (LOWER(mailbox) = LOWER(?2) OR LOWER(mailbox_kind) = LOWER(?3))
-        """
-        if unreadOnly {
-            sql += " AND is_unread = 1"
+        read(nil) { db in
+            let kind = MailboxMatcher.kind(ofName: mailbox).rawValue
+            var sql = """
+            SELECT COUNT(*) FROM messages
+            WHERE account_id = ?1 AND (LOWER(mailbox) = LOWER(?2) OR LOWER(mailbox_kind) = LOWER(?3))
+            """
+            if unreadOnly {
+                sql += " AND is_unread = 1"
+            }
+            var stmt: OpaquePointer?
+            guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK, let stmt else { return nil }
+            defer { sqlite3_finalize(stmt) }
+            bindText(stmt, index: 1, accountID.uuidString)
+            bindText(stmt, index: 2, mailbox)
+            bindText(stmt, index: 3, kind)
+            guard sqlite3_step(stmt) == SQLITE_ROW else { return nil }
+            return Int(sqlite3_column_int(stmt, 0))
         }
-        var stmt: OpaquePointer?
-        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK, let stmt else { return nil }
-        defer { sqlite3_finalize(stmt) }
-        bindText(stmt, index: 1, accountID.uuidString)
-        bindText(stmt, index: 2, mailbox)
-        bindText(stmt, index: 3, kind)
-        guard sqlite3_step(stmt) == SQLITE_ROW else { return nil }
-        return Int(sqlite3_column_int(stmt, 0))
     }
 
     func canSatisfyFromCache(
@@ -744,24 +786,22 @@ final class MailboxCacheStore: @unchecked Sendable {
     }
 
     func hasLazyQueryCached(accountID: UUID, request: FolderSearchSpec) -> Bool {
-        lock.lock()
-        defer { lock.unlock() }
-        guard let db else { return false }
-
-        let key = Self.queryKey(for: request)
-        let sql = """
-        SELECT limit_fetched FROM cached_queries
-        WHERE account_id = ?1 AND query_key = ?2
-        LIMIT 1;
-        """
-        var stmt: OpaquePointer?
-        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK, let stmt else { return false }
-        defer { sqlite3_finalize(stmt) }
-        bindText(stmt, index: 1, accountID.uuidString)
-        bindText(stmt, index: 2, key)
-        guard sqlite3_step(stmt) == SQLITE_ROW else { return false }
-        let fetched = Int(sqlite3_column_int(stmt, 0))
-        return fetched >= max(request.limit, 1)
+        read(false) { db in
+            let key = Self.queryKey(for: request)
+            let sql = """
+            SELECT limit_fetched FROM cached_queries
+            WHERE account_id = ?1 AND query_key = ?2
+            LIMIT 1;
+            """
+            var stmt: OpaquePointer?
+            guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK, let stmt else { return false }
+            defer { sqlite3_finalize(stmt) }
+            bindText(stmt, index: 1, accountID.uuidString)
+            bindText(stmt, index: 2, key)
+            guard sqlite3_step(stmt) == SQLITE_ROW else { return false }
+            let fetched = Int(sqlite3_column_int(stmt, 0))
+            return fetched >= max(request.limit, 1)
+        }
     }
 
     func invalidateLazyQueries(accountID: UUID) {
@@ -900,10 +940,9 @@ final class MailboxCacheStore: @unchecked Sendable {
     /// Bytes held in live database pages (messages, bodies and the search index). Unlike the file size,
     /// this drops as soon as rows are deleted.
     func usedBytes() -> Int64 {
-        lock.lock()
-        defer { lock.unlock() }
-        guard let db else { return 0 }
-        return usedBytesLocked(on: db)
+        read(0) { db in
+            return usedBytesLocked(on: db)
+        }
     }
 
     private func usedBytesLocked(on db: OpaquePointer) -> Int64 {
@@ -918,6 +957,8 @@ final class MailboxCacheStore: @unchecked Sendable {
     /// server until the next sync.
     @discardableResult
     func freeSpace(bytes target: Int64) -> CacheFreeSpaceResult {
+        // Pending "last opened" updates must land first so recently read mail is kept.
+        touchQueue.sync {}
         lock.lock()
         guard let db, target > 0 else {
             lock.unlock()
@@ -1030,119 +1071,113 @@ final class MailboxCacheStore: @unchecked Sendable {
     // MARK: - Contacts & Threads from Cache
 
     func frequentContacts(accountID: UUID, accountEmail: String, limit: Int) -> [MailContact] {
-        lock.lock()
-        defer { lock.unlock() }
-        guard let db else { return [] }
+        read([]) { db in
+            let sql = """
+            SELECT to_json FROM messages
+            WHERE account_id = ?1 AND (LOWER(mailbox_kind) = 'sent' OR LOWER(from_addr) LIKE ?2)
+            ORDER BY COALESCE(date_ts, 0) DESC
+            LIMIT 200;
+            """
+            var stmt: OpaquePointer?
+            guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK, let stmt else { return [] }
+            defer { sqlite3_finalize(stmt) }
+            bindText(stmt, index: 1, accountID.uuidString)
+            bindText(stmt, index: 2, "%\(accountEmail.lowercased())%")
 
-        let sql = """
-        SELECT to_json FROM messages
-        WHERE account_id = ?1 AND (LOWER(mailbox_kind) = 'sent' OR LOWER(from_addr) LIKE ?2)
-        ORDER BY COALESCE(date_ts, 0) DESC
-        LIMIT 200;
-        """
-        var stmt: OpaquePointer?
-        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK, let stmt else { return [] }
-        defer { sqlite3_finalize(stmt) }
-        bindText(stmt, index: 1, accountID.uuidString)
-        bindText(stmt, index: 2, "%\(accountEmail.lowercased())%")
-
-        var counts: [String: (name: String, count: Int)] = [:]
-        while sqlite3_step(stmt) == SQLITE_ROW {
-            let recipients = decodeStringArray(columnText(stmt, 0))
-            for raw in recipients {
-                let lower = raw.lowercased()
-                if lower.contains(accountEmail.lowercased()) { continue }
-                let existing = counts[lower]
-                counts[lower] = (raw, (existing?.count ?? 0) + 1)
+            var counts: [String: (name: String, count: Int)] = [:]
+            while sqlite3_step(stmt) == SQLITE_ROW {
+                let recipients = decodeStringArray(columnText(stmt, 0))
+                for raw in recipients {
+                    let lower = raw.lowercased()
+                    if lower.contains(accountEmail.lowercased()) { continue }
+                    let existing = counts[lower]
+                    counts[lower] = (raw, (existing?.count ?? 0) + 1)
+                }
             }
+            return counts.map { MailContact(address: $0.key, name: $0.value.name, count: $0.value.count) }
+                .sorted { $0.count > $1.count }
+                .prefix(max(limit, 1))
+                .map { $0 }
         }
-        return counts.map { MailContact(address: $0.key, name: $0.value.name, count: $0.value.count) }
-            .sorted { $0.count > $1.count }
-            .prefix(max(limit, 1))
-            .map { $0 }
     }
 
     func accountStats(accountID: UUID) -> AccountCacheStats {
-        lock.lock()
-        defer { lock.unlock() }
-        guard let db else { return AccountCacheStats(accountID: accountID) }
+        read(AccountCacheStats(accountID: accountID)) { db in
+            let id = accountID.uuidString
+            var result = AccountCacheStats(accountID: accountID)
 
-        let id = accountID.uuidString
-        var result = AccountCacheStats(accountID: accountID)
-
-        var msgStmt: OpaquePointer?
-        if sqlite3_prepare_v2(
-            db,
-            "SELECT COUNT(*), MIN(date_ts), MAX(date_ts) FROM messages WHERE account_id = ?1;",
-            -1,
-            &msgStmt,
-            nil
-        ) == SQLITE_OK, let msgStmt {
-            bindText(msgStmt, index: 1, id)
-            if sqlite3_step(msgStmt) == SQLITE_ROW {
-                result.envelopeCount = Int(sqlite3_column_int(msgStmt, 0))
-                result.oldestMessageAt = columnOptionalDate(msgStmt, 1)
-                result.newestMessageAt = columnOptionalDate(msgStmt, 2)
+            var msgStmt: OpaquePointer?
+            if sqlite3_prepare_v2(
+                db,
+                "SELECT COUNT(*), MIN(date_ts), MAX(date_ts) FROM messages WHERE account_id = ?1;",
+                -1,
+                &msgStmt,
+                nil
+            ) == SQLITE_OK, let msgStmt {
+                bindText(msgStmt, index: 1, id)
+                if sqlite3_step(msgStmt) == SQLITE_ROW {
+                    result.envelopeCount = Int(sqlite3_column_int(msgStmt, 0))
+                    result.oldestMessageAt = columnOptionalDate(msgStmt, 1)
+                    result.newestMessageAt = columnOptionalDate(msgStmt, 2)
+                }
+                sqlite3_finalize(msgStmt)
             }
-            sqlite3_finalize(msgStmt)
-        }
 
-        result.bodyCount = scalarInt(
-            "SELECT COUNT(*) FROM message_bodies WHERE account_id = ?1;",
-            param: id,
-            on: db
-        )
-        result.folderCount = scalarInt(
-            "SELECT COUNT(*) FROM folders WHERE account_id = ?1;",
-            param: id,
-            on: db
-        )
-        result.attachmentCount = scalarInt(
-            "SELECT COUNT(*) FROM attachments WHERE account_id = ?1;",
-            param: id,
-            on: db
-        )
+            result.bodyCount = scalarInt(
+                "SELECT COUNT(*) FROM message_bodies WHERE account_id = ?1;",
+                param: id,
+                on: db
+            )
+            result.folderCount = scalarInt(
+                "SELECT COUNT(*) FROM folders WHERE account_id = ?1;",
+                param: id,
+                on: db
+            )
+            result.attachmentCount = scalarInt(
+                "SELECT COUNT(*) FROM attachments WHERE account_id = ?1;",
+                param: id,
+                on: db
+            )
 
-        var syncStmt: OpaquePointer?
-        if sqlite3_prepare_v2(
-            db,
-            "SELECT watermark, last_checked_at, last_synced_at FROM account_sync_state WHERE account_id = ?1;",
-            -1,
-            &syncStmt,
-            nil
-        ) == SQLITE_OK, let syncStmt {
-            bindText(syncStmt, index: 1, id)
-            if sqlite3_step(syncStmt) == SQLITE_ROW {
-                result.watermark = columnText(syncStmt, 0)
-                result.lastCheckedAt = columnOptionalDate(syncStmt, 1)
-                result.lastSyncedAt = columnOptionalDate(syncStmt, 2)
+            var syncStmt: OpaquePointer?
+            if sqlite3_prepare_v2(
+                db,
+                "SELECT watermark, last_checked_at, last_synced_at FROM account_sync_state WHERE account_id = ?1;",
+                -1,
+                &syncStmt,
+                nil
+            ) == SQLITE_OK, let syncStmt {
+                bindText(syncStmt, index: 1, id)
+                if sqlite3_step(syncStmt) == SQLITE_ROW {
+                    result.watermark = columnText(syncStmt, 0)
+                    result.lastCheckedAt = columnOptionalDate(syncStmt, 1)
+                    result.lastSyncedAt = columnOptionalDate(syncStmt, 2)
+                }
+                sqlite3_finalize(syncStmt)
             }
-            sqlite3_finalize(syncStmt)
+            result.dailyBandwidthBytes = dailyBandwidthBytesLocked(accountID: id, on: db)
+            return result
         }
-        result.dailyBandwidthBytes = dailyBandwidthBytesLocked(accountID: id, on: db)
-        return result
     }
 
     func stats() -> MailboxCacheStats {
-        lock.lock()
-        defer { lock.unlock() }
-        guard let db else { return MailboxCacheStats() }
+        read(MailboxCacheStats()) { db in
+            var result = MailboxCacheStats()
+            result.messageCount = scalarInt("SELECT COUNT(*) FROM messages;", on: db)
+            result.bodyCount = scalarInt("SELECT COUNT(*) FROM message_bodies;", on: db)
+            result.folderCount = scalarInt("SELECT COUNT(*) FROM folders;", on: db)
+            result.attachmentCount = scalarInt("SELECT COUNT(*) FROM attachments;", on: db)
 
-        var result = MailboxCacheStats()
-        result.messageCount = scalarInt("SELECT COUNT(*) FROM messages;", on: db)
-        result.bodyCount = scalarInt("SELECT COUNT(*) FROM message_bodies;", on: db)
-        result.folderCount = scalarInt("SELECT COUNT(*) FROM folders;", on: db)
-        result.attachmentCount = scalarInt("SELECT COUNT(*) FROM attachments;", on: db)
-
-        var stmt: OpaquePointer?
-        if sqlite3_prepare_v2(db, "SELECT MAX(last_synced_at) FROM account_sync_state;", -1, &stmt, nil) == SQLITE_OK, let stmt {
-            if sqlite3_step(stmt) == SQLITE_ROW {
-                result.lastSyncAt = columnOptionalDate(stmt, 0)
+            var stmt: OpaquePointer?
+            if sqlite3_prepare_v2(db, "SELECT MAX(last_synced_at) FROM account_sync_state;", -1, &stmt, nil) == SQLITE_OK, let stmt {
+                if sqlite3_step(stmt) == SQLITE_ROW {
+                    result.lastSyncAt = columnOptionalDate(stmt, 0)
+                }
+                sqlite3_finalize(stmt)
             }
-            sqlite3_finalize(stmt)
+            result.sizeBytes = Self.directorySize(at: directoryURL)
+            return result
         }
-        result.sizeBytes = Self.directorySize(at: directoryURL)
-        return result
     }
 
     func clearAll(accountID: UUID? = nil) {
@@ -1669,9 +1704,18 @@ final class MailboxCacheStore: @unchecked Sendable {
         return Int(sqlite3_column_int(stmt, 0))
     }
 
+    /// Coalesced: a sync writes in many small batches, and each notification re-renders every cache-backed view.
     private func notifyChange() {
         guard self === MailboxCacheStore.shared else { return }
-        DispatchQueue.main.async {
+        notifyLock.lock()
+        defer { notifyLock.unlock() }
+        guard !notifyPending else { return }
+        notifyPending = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+            guard let self else { return }
+            self.notifyLock.lock()
+            self.notifyPending = false
+            self.notifyLock.unlock()
             NotificationCenter.default.post(name: .mailboxCacheDidChange, object: nil)
         }
     }

@@ -787,13 +787,13 @@
 				CODE_SIGN_ENTITLEMENTS = MailMCP/MailMCP.entitlements;
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 5;
+				CURRENT_PROJECT_VERSION = 6;
 				ENABLE_HARDENED_RUNTIME = NO;
 				INFOPLIST_FILE = MailMCP/Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"@executable_path/../Frameworks",
 				);
-				MARKETING_VERSION = 1.4.0;
+				MARKETING_VERSION = 1.5.0;
 				PRODUCT_BUNDLE_IDENTIFIER = com.mailmcp.app;
 				PRODUCT_NAME = MailMCP;
 				SDKROOT = macosx;
@@ -809,13 +809,13 @@
 				CODE_SIGN_ENTITLEMENTS = MailMCP/MailMCP.entitlements;
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 5;
+				CURRENT_PROJECT_VERSION = 6;
 				ENABLE_HARDENED_RUNTIME = NO;
 				INFOPLIST_FILE = MailMCP/Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"@executable_path/../Frameworks",
 				);
-				MARKETING_VERSION = 1.4.0;
+				MARKETING_VERSION = 1.5.0;
 				PRODUCT_BUNDLE_IDENTIFIER = com.mailmcp.app;
 				PRODUCT_NAME = MailMCP;
 				SDKROOT = macosx;

@@ -46,7 +46,7 @@ enum MCPToolCatalog {
 
         MCPToolInfo(name: "modify_message", title: "Modify message", intro: "Archive, trash, read/unread, or change labels. Only your mailbox.", audience: .mailboxAlter),
         MCPToolInfo(name: "file_message", title: "File message", intro: "Moves a message into a folder or applies labels. Nobody else is notified.", audience: .mailboxAlter),
-        MCPToolInfo(name: "file_search", title: "File search", intro: "Moves or labels every match for a search into a folder. mailbox=all searches Gmail All Mail. has:nouserlabels works. Empty query is refused.", audience: .mailboxAlter),
+        MCPToolInfo(name: "file_search", title: "File matching messages", intro: "Moves or labels every match for a search into a folder. mailbox=all searches Gmail All Mail. has:nouserlabels works. Empty query is refused.", audience: .mailboxAlter),
         MCPToolInfo(name: "update_draft", title: "Update draft", intro: "Edits an existing draft. Does not send.", audience: .mailboxAlter),
         MCPToolInfo(name: "delete_draft", title: "Delete draft", intro: "Deletes a draft from your mailbox.", audience: .mailboxAlter),
 

@@ -52,3 +52,21 @@ Random "monkey" testing to discover crashes, hangs and broken state, plus faster
 - [ ] **Sanitizer runs** for the monkey scheme: Thread Sanitizer, Main Thread Checker, Address Sanitizer, plus scanning the console for SwiftUI runtime warnings.
 
 Catches: crashes like the Free up space slider trap, layout-loop crashes from resizing and column drags, threading bugs. Doesn't catch: visual-only problems (review saved screenshots) or real-server behavior (Gmail rate limits, unusual IMAP responses).
+
+## IMAP Connection Reuse
+
+Every IMAP operation (opening an uncached message, listing a folder, marking read, archiving) currently opens a new connection, logs in, selects the folder and disconnects. That costs several network round trips per click, which is most of the remaining delay when a message isn't cached yet.
+
+- [ ] Keep one logged-in connection per account, reused across operations and serialized so commands don't interleave.
+- [ ] Remember the selected folder and skip `SELECT` when it hasn't changed.
+- [ ] Close idle connections after a minute or two, and reconnect transparently when the server drops one (timeouts, sleep / wake, network change).
+- [ ] A separate connection for background sync so a long sync never queues the reader's fetches behind it.
+- [ ] Measure before / after: time from click to message shown for an uncached message.
+
+## UI Polish (from the October UI review)
+
+- [ ] **Responsive Tool History dashboard:** at narrow widths "Calls by Tool" and its description wrap into single letters beside the By Tool / By Mailbox picker, and By Mailbox's fixed label widths push charts and agent stats past the window edge. Stack the header above the picker and let the side column move below the breakdown when narrow.
+- [ ] **OAuth setup help:** step-by-step instructions for creating the Google client ID / secret (and Microsoft), plus a saved / not saved indicator on the OAuth fields.
+- [ ] **Effective permissions summary:** one line under the safety preset listing what agents can actually do once individual MCP tool switches are applied (for example "Agents can read, draft and file; sending is off").
+- [ ] **Failure reasons in tool history:** failed calls show their arguments but not why they failed. Check whether the call log keeps the error text; store it if not, and show it on the failed entry.
+- [ ] **Account filter in the sidebar:** a filter field above the mailbox list (match name or address) for vaults with many accounts.

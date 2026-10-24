@@ -63,6 +63,8 @@ final class AppState: ObservableObject {
     @Published var pendingSettingsOpen = false
     @Published private var liveFolders: [UUID: [MailFolderCount]] = [:]
     private var folderRefreshDates: [UUID: Date] = [:]
+    private var statsMemo: [UUID: AccountCacheStats] = [:]
+    private var statsMemoRevision = -1
 
     var mcpAgentCount: Int { mcpAgents.count }
 
@@ -872,9 +874,16 @@ final class AppState: ObservableObject {
         return result
     }
 
+    /// Memoized per cache revision: the sidebar asks for every mailbox on each render.
     func cacheStats(for account: MailAccount) -> AccountCacheStats {
-        _ = cacheRevision
-        return MailboxCacheStore.shared.accountStats(accountID: account.id)
+        if statsMemoRevision != cacheRevision {
+            statsMemoRevision = cacheRevision
+            statsMemo = [:]
+        }
+        if let stats = statsMemo[account.id] { return stats }
+        let stats = MailboxCacheStore.shared.accountStats(accountID: account.id)
+        statsMemo[account.id] = stats
+        return stats
     }
 
     func mailFolders(for account: MailAccount) -> [MailFolderCount] {

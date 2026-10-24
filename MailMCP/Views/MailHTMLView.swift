@@ -106,10 +106,14 @@ struct MailHTMLView: NSViewRepresentable {
         configuration.defaultWebpagePreferences.allowsContentJavaScript = false
         configuration.preferences.javaScriptCanOpenWindowsAutomatically = false
         configuration.websiteDataStore = .nonPersistent()
-        let webView = WKWebView(frame: .zero, configuration: configuration)
+        let webView = FittingWebView(frame: .zero, configuration: configuration)
         webView.navigationDelegate = context.coordinator
         webView.allowsBackForwardNavigationGestures = false
         webView.allowsMagnification = true
+        webView.onWidthChange = { [weak coordinator = context.coordinator, weak webView] in
+            guard let coordinator, let webView else { return }
+            coordinator.scheduleFit(webView, delayNs: 120_000_000)
+        }
         return webView
     }
 
@@ -117,9 +121,60 @@ struct MailHTMLView: NSViewRepresentable {
         context.coordinator.render(html: html, allowRemoteContent: allowRemoteContent, in: webView)
     }
 
+    final class FittingWebView: WKWebView {
+        var onWidthChange: (() -> Void)?
+        private var lastWidth: CGFloat = 0
+
+        override func setFrameSize(_ newSize: NSSize) {
+            super.setFrameSize(newSize)
+            guard abs(newSize.width - lastWidth) > 0.5 else { return }
+            lastWidth = newSize.width
+            onWidthChange?()
+        }
+    }
+
     final class Coordinator: NSObject, WKNavigationDelegate {
         private var renderedKey: Int?
         private var renderToken = 0
+        private var fitTask: Task<Void, Never>?
+
+        /// Fixed-width newsletters (often 600–700 px tables) are zoomed out to the reader's width instead of running off the edge.
+        @MainActor
+        func scheduleFit(_ webView: WKWebView, delayNs: UInt64) {
+            fitTask?.cancel()
+            fitTask = Task { @MainActor [weak webView] in
+                if delayNs > 0 {
+                    try? await Task.sleep(nanoseconds: delayNs)
+                }
+                guard !Task.isCancelled, let webView else { return }
+                await Self.fit(webView)
+            }
+        }
+
+        @MainActor
+        private static func fit(_ webView: WKWebView) async {
+            let available = webView.bounds.width
+            guard available > 0 else { return }
+            // Shrinking the root to 1px makes scrollWidth report the narrowest width the content can lay out in, independent of the current zoom.
+            let script = """
+            const root = document.documentElement;
+            const previous = root.style.width;
+            root.style.width = '1px';
+            const needed = root.scrollWidth;
+            root.style.width = previous;
+            return needed;
+            """
+            guard let needed = (try? await webView.callAsyncJavaScript(script, contentWorld: .defaultClient)) as? Double,
+                  needed > 0 else { return }
+            let zoom = min(1, max(0.5, Double(available) / needed))
+            if abs(webView.pageZoom - zoom) > 0.01 {
+                webView.pageZoom = zoom
+            }
+        }
+
+        func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+            Task { @MainActor in self.scheduleFit(webView, delayNs: 0) }
+        }
 
         @MainActor
         func render(html: String, allowRemoteContent: Bool, in webView: WKWebView) {

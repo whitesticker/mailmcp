@@ -30,7 +30,9 @@ private struct SidebarConfigurator: NSViewRepresentable {
                 if let splitVC = current as? NSSplitViewController,
                    let firstItem = splitVC.splitViewItems.first {
                     coordinator.configured = true
-                    firstItem.canCollapse = false
+                    for item in splitVC.splitViewItems.dropLast() {
+                        item.canCollapse = false
+                    }
                     firstItem.minimumThickness = minWidth
                     firstItem.maximumThickness = maxWidth
                     if let root = view.window?.contentView {
@@ -61,7 +63,9 @@ private struct SidebarConfigurator: NSViewRepresentable {
 struct ContentView: View {
     @EnvironmentObject private var appState: AppState
     @State private var selected: ContentSelection?
-    @State private var settingsStart: SettingsWorkspaceView.Item = .pane(.safety)
+    @State private var settingsItem: SettingsItem = .pane(.safety)
+    @State private var mailboxPane: MailboxPane?
+    @State private var pendingID: UUID?
     var body: some View {
         NavigationSplitView(columnVisibility: .constant(.all)) {
             VStack(spacing: 0) {
@@ -96,46 +100,103 @@ struct ContentView: View {
             .navigationSplitViewColumnWidth(min: 220, ideal: 255, max: 360)
             .background(SidebarConfigurator(minWidth: 220, maxWidth: 360))
             .toolbar(removing: .sidebarToggle)
-        } detail: {
-            if selected == .settings {
-                SettingsWorkspaceView(initialItem: settingsStart)
-            } else if selected == .pending {
-                PendingSendsView()
-            } else if case .account(let id) = selected, let account = appState.account(id: id) {
-                MailboxWorkspaceView(account: account)
-                    .id(account.id)
-            } else {
-                VStack(spacing: 12) {
-                    Image(systemName: "envelope.open")
-                        .font(.system(size: 36))
-                        .foregroundStyle(.secondary)
-                    if appState.unlockedVaults.flatMap(\.accounts).isEmpty {
-                        Text("Add a mailbox to get started.")
-                            .foregroundStyle(.secondary)
-                        Button("Add an Account…") {
-                            settingsStart = .addAccount
-                            selected = .settings
-                        }
-                    } else {
-                        Text("Select a mailbox.")
-                            .foregroundStyle(.secondary)
+            .toolbar {
+                // A window with no toolbar items drops its toolbar and shifts every column up, so this one is always present.
+                ToolbarItem {
+                    Button {
+                        appState.lock()
+                    } label: {
+                        Label("Lock", systemImage: "lock")
                     }
-                    if let status = appState.statusMessage {
-                        Text(status)
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
+                    .help("Lock all vaults")
                 }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
+        } content: {
+            Group {
+                switch selected {
+                case .settings:
+                    SettingsItemList(item: $settingsItem)
+                case .pending:
+                    PendingSendsList(selection: $pendingID)
+                case .account(let id):
+                    if let account = appState.account(id: id) {
+                        MailboxFolderList(account: account, pane: $mailboxPane)
+                    } else {
+                        Color.clear
+                    }
+                case nil:
+                    Color.clear
+                }
+            }
+            .navigationSplitViewColumnWidth(min: 150, ideal: 200, max: 320)
+            .toolbar { ColumnToolbarTitle(title: middleColumnTitle) }
+        } detail: {
+            Group {
+                switch selected {
+                case .settings:
+                    SettingsItemDetail(item: settingsItem)
+                case .pending:
+                    PendingSendDetail(selection: pendingID)
+                case .account(let id):
+                    if let account = appState.account(id: id) {
+                        MailboxPaneDetail(account: account, pane: mailboxPane)
+                    } else {
+                        placeholder
+                    }
+                case nil:
+                    placeholder
+                }
+            }
+            .navigationSplitViewColumnWidth(min: 560, ideal: 800)
         }
+        .toolbar(removing: .title)
         .onChange(of: selected) { _, newValue in
             if newValue != .settings {
-                settingsStart = .pane(.safety)
+                settingsItem = .pane(.safety)
             }
+            mailboxPane = nil
         }
         .onAppear(perform: consumeSettingsRequest)
         .onChange(of: appState.pendingSettingsOpen) { _, _ in consumeSettingsRequest() }
+    }
+
+    private var middleColumnTitle: String {
+        switch selected {
+        case .settings:
+            return "Settings"
+        case .pending:
+            return "Needs Confirmation"
+        case .account(let id):
+            guard let account = appState.account(id: id) else { return "" }
+            return account.displayName.isEmpty ? account.email : account.displayName
+        case nil:
+            return ""
+        }
+    }
+
+    private var placeholder: some View {
+        VStack(spacing: 12) {
+            Image(systemName: "envelope.open")
+                .font(.system(size: 36))
+                .foregroundStyle(.secondary)
+            if appState.unlockedVaults.flatMap(\.accounts).isEmpty {
+                Text("Add a mailbox to get started.")
+                    .foregroundStyle(.secondary)
+                Button("Add an Account…") {
+                    selected = .settings
+                    settingsItem = .addAccount
+                }
+            } else {
+                Text("Select a mailbox.")
+                    .foregroundStyle(.secondary)
+            }
+            if let status = appState.statusMessage {
+                Text(status)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
     private func consumeSettingsRequest() {
@@ -165,8 +226,35 @@ struct ContentView: View {
             .frame(maxWidth: .infinity, alignment: .leading)
         }
         .padding(.vertical, 2)
-        .help(status.text)
+        .help("\(status.kindHelp) · \(status.text)")
         .tag(ContentSelection.account(account.id))
+    }
+}
+
+/// The middle column's title, shown in the toolbar strip above it. It also keeps the toolbar split at that column's
+/// edge: SwiftUI only splits there when the column has an item of its own, otherwise the detail buttons drift left.
+struct ColumnToolbarTitle: ToolbarContent {
+    let title: String
+
+    var body: some ToolbarContent {
+        if #available(macOS 26, *) {
+            item.sharedBackgroundVisibility(.hidden)
+        } else {
+            item
+        }
+    }
+
+    private var item: some ToolbarContent {
+        ToolbarItem {
+            Text(title.isEmpty ? " " : title)
+                .font(.largeTitle.bold())
+                .lineLimit(1)
+                .minimumScaleFactor(0.6)
+                .truncationMode(.tail)
+                .frame(maxWidth: 260, alignment: .leading)
+                .padding(.leading, 6)
+                .accessibilityAddTraits(.isHeader)
+        }
     }
 }
 
@@ -197,6 +285,36 @@ struct MailboxStatus {
     let badge: (title: String, prominent: Bool)?
 
     var text: String { lines.joined(separator: " · ") }
+
+    var badgeHelp: String? {
+        switch badge?.title {
+        case "LAZY": return "Lazy: nothing syncs in the background. Messages you or an agent open are kept on this Mac."
+        case "AUTO": return "Auto: recent Inbox mail syncs to this Mac on a schedule."
+        case "SYNC": return "Manual: recent Inbox mail syncs to this Mac when you press Sync now."
+        case "FULL": return "Full: every folder syncs to this Mac in the background."
+        default: return nil
+        }
+    }
+
+    var kindHelp: String {
+        switch kind {
+        case .syncing: return "Syncing now"
+        case .error: return "Red: the last connection to the server failed"
+        case .cached: return "Green: cached on this Mac"
+        case .lazy: return "Blue: lazy cache, nothing synced in the background"
+        case .notSynced: return "Orange: not synced yet"
+        }
+    }
+
+    static func help(forLine line: String) -> String? {
+        if line.hasSuffix("header") || line.hasSuffix("headers") {
+            return "Headers: messages whose sender, subject and date are stored on this Mac"
+        }
+        if line.hasSuffix("body") || line.hasSuffix("bodies") {
+            return "Bodies: messages whose full text is stored too, so they open and search without the server"
+        }
+        return nil
+    }
 
     @MainActor
     init(account: MailAccount, appState: AppState) {
@@ -268,6 +386,7 @@ private struct MailboxInfoCard: View {
         VStack(alignment: .leading, spacing: 4) {
             HStack(spacing: 6) {
                 MailboxStatusIndicator(status: status)
+                    .help(status.kindHelp)
                 if let badge = status.badge {
                     Text(badge.title)
                         .font(.system(size: 9, weight: badge.prominent ? .semibold : .medium))
@@ -276,6 +395,7 @@ private struct MailboxInfoCard: View {
                         .background((badge.prominent ? Color.accentColor : Color.secondary).opacity(0.15))
                         .foregroundStyle(badge.prominent ? Color.accentColor : Color.secondary)
                         .clipShape(Capsule())
+                        .help(status.badgeHelp ?? "")
                 }
                 Text(account.provider.title)
                     .font(.caption)
@@ -289,6 +409,7 @@ private struct MailboxInfoCard: View {
                     .foregroundStyle(status.kind == .error ? Color.red : Color.secondary)
                     .lineLimit(status.kind == .error ? 3 : 1)
                     .fixedSize(horizontal: false, vertical: true)
+                    .help(MailboxStatus.help(forLine: line) ?? "")
             }
         }
         .padding(10)
@@ -308,6 +429,7 @@ struct AccountDetailView: View {
     @State private var nickname: String
     @State private var nicknameStatus: String?
     @State private var cacheNotice: String?
+    @State private var confirmRemove = false
 
     init(account: MailAccount) {
         self.account = account
@@ -359,10 +481,13 @@ struct AccountDetailView: View {
                     Button("Modify account credentials…") {
                         showEditAccount = true
                     }
-                    Button("Remove account", role: .destructive) {
-                        try? appState.removeAccount(account.id)
+                    Button("Remove account…", role: .destructive) {
+                        confirmRemove = true
                     }
                 }
+                Text("Remove account deletes this mailbox’s sign-in from the vault and its cached mail from this Mac. Nothing changes on the server.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
 
             Section("Background Sync") {
@@ -422,6 +547,9 @@ struct AccountDetailView: View {
                     }
                     .disabled(isSyncing || (stats.envelopeCount == 0 && stats.bodyCount == 0 && stats.folderCount == 0))
                 }
+                Text("Clear mailbox cache deletes only this mailbox’s local copies. Mail stays on the server, and the next sync downloads it again.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
 
             Section("Local Cache") {
@@ -447,7 +575,9 @@ struct AccountDetailView: View {
                             Circle()
                                 .fill(Color.green)
                                 .frame(width: 8, height: 8)
-                            Text(cooldownStatusText(stats: stats, policy: effectivePolicy))
+                            TimelineView(.periodic(from: .now, by: 30)) { context in
+                                Text(syncedStatusText(stats: stats, now: context.date))
+                            }
                         } else if effectivePolicy.mode == .lazy {
                             Circle()
                                 .fill(Color.blue)
@@ -511,6 +641,18 @@ struct AccountDetailView: View {
         }
         .formStyle(.grouped)
         .navigationTitle(account.displayName.isEmpty ? account.email : account.displayName)
+        .toolbar {
+            ToolbarItem {
+                Button {
+                    cacheNotice = nil
+                    Task { await appState.syncMailboxCacheNow(account: account) }
+                } label: {
+                    Label("Sync Now", systemImage: "arrow.clockwise")
+                }
+                .help(account.syncScope == .off ? "Background sync is off for this mailbox" : "Sync this mailbox now")
+                .disabled(isSyncing || account.syncScope == .off)
+            }
+        }
         .onChange(of: account.id) { _, _ in
             result = nil
             busy = false
@@ -520,6 +662,17 @@ struct AccountDetailView: View {
         }
         .onChange(of: account.displayName) { _, value in
             nickname = value == account.email ? "" : value
+        }
+        .confirmationDialog(
+            "Remove \(account.email)?",
+            isPresented: $confirmRemove,
+            titleVisibility: .visible
+        ) {
+            Button("Remove Account", role: .destructive) {
+                try? appState.removeAccount(account.id)
+            }
+        } message: {
+            Text("Its sign-in is deleted from this vault and its cached mail from this Mac. Mail on the server is not touched. You can add the account again later.")
         }
         .sheet(isPresented: $showEditAccount) {
             AddAccountView(editingAccount: account)
@@ -561,15 +714,12 @@ struct AccountDetailView: View {
         return "\(relative) (\(next.formatted(date: .omitted, time: .shortened)))"
     }
 
-    private func cooldownStatusText(stats: AccountCacheStats, policy: CacheSyncPolicy) -> String {
-        if let checked = stats.lastCheckedAt {
-            let elapsed = Int(Date().timeIntervalSince(checked))
-            let remaining = policy.cooldownSeconds - elapsed
-            if remaining > 0 {
-                return "Synced · cooldown (\(remaining)s left)"
-            }
+    private func syncedStatusText(stats: AccountCacheStats, now: Date) -> String {
+        guard let checked = stats.lastCheckedAt ?? stats.lastSyncedAt else { return "Synced" }
+        if now.timeIntervalSince(checked) < 60 {
+            return "Synced · checked just now"
         }
-        return "Synced · ready"
+        return "Synced · checked \(RelativeDateTimeFormatter().localizedString(for: checked, relativeTo: now))"
     }
 
     private func saveNickname() {
@@ -605,59 +755,43 @@ enum ContentSelection: Hashable {
 }
 
 /// The folder column for one mailbox, followed by either the reader (message list and message) or the mailbox's settings.
-struct MailboxWorkspaceView: View {
-    enum Pane: Hashable {
-        case folder(String)
-        case settings
-    }
+enum MailboxPane: Hashable {
+    case folder(String)
+    case settings
 
+    static func resolved(_ pane: MailboxPane?, folders: [MailFolderCount]) -> MailboxPane {
+        pane ?? .folder(ReaderFolders.inboxName(in: folders))
+    }
+}
+
+/// A mailbox's folders, shown in the window's middle column.
+struct MailboxFolderList: View {
     @EnvironmentObject private var appState: AppState
     let account: MailAccount
-    @State private var pane: Pane?
-    @AppStorage("reader.folderColumnWidth") private var folderWidth: Double = 200
-
-    private static let folderRange: ClosedRange<Double> = 150...320
-    private static let contentMinWidth: Double = 560
+    @Binding var pane: MailboxPane?
 
     var body: some View {
-        GeometryReader { geometry in
-            let available = Double(geometry.size.width) - Double(ColumnResizeHandle.hitWidth)
-            let width = max(Self.folderRange.lowerBound, min(folderWidth, available - Self.contentMinWidth))
-            HStack(spacing: 0) {
-                folderList
-                    .frame(width: width)
-                ColumnResizeHandle(width: $folderWidth, range: Self.folderRange)
-                content
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-            }
-        }
-        .onAppear { appState.refreshFolders(for: account) }
-    }
-
-    private var current: Pane {
-        pane ?? .folder(ReaderFolders.inboxName(in: appState.mailFolders(for: account)))
-    }
-
-    private var folderList: some View {
+        let current = MailboxPane.resolved(pane, folders: appState.mailFolders(for: account))
         let folders = ReaderFolders.visible(appState.mailFolders(for: account))
-        return VStack(spacing: 0) {
-            ColumnTitle(text: account.displayName.isEmpty ? account.email : account.displayName)
+        VStack(spacing: 0) {
             MailboxInfoCard(account: account)
+                .padding(.top, 6)
             List(selection: Binding(get: { current }, set: { pane = $0 })) {
                 Section {
                     Label("Mailbox Settings", systemImage: "gearshape")
-                        .tag(Pane.settings)
+                        .tag(MailboxPane.settings)
                 }
                 Section("Folders") {
                     if folders.isEmpty {
                         Label("Inbox", systemImage: "tray")
-                            .tag(Pane.folder("INBOX"))
+                            .tag(MailboxPane.folder("INBOX"))
                     }
                     ForEach(folders) { folder in
                         Label(folder.title, systemImage: folder.systemImage)
                             .lineLimit(1)
                             .badge(showsBadge(folder) ? (folder.unseen ?? 0) : 0)
-                            .tag(Pane.folder(folder.name))
+                            .help(folderHelp(folder))
+                            .tag(MailboxPane.folder(folder.name))
                     }
                 }
             }
@@ -665,22 +799,33 @@ struct MailboxWorkspaceView: View {
             .scrollContentBackground(.hidden)
         }
         .background(Color(nsColor: .controlBackgroundColor))
+        .onAppear { appState.refreshFolders(for: account) }
+        .onChange(of: account.id) { _, _ in appState.refreshFolders(for: account) }
     }
 
-    @ViewBuilder
-    private var content: some View {
-        switch current {
-        case .settings:
-            AccountDetailView(account: account)
-        case .folder(let name):
-            MailboxReaderView(account: account, folder: name) {
-                pane = .settings
-            }
-            .id(name)
-        }
+    private func folderHelp(_ folder: ReaderFolder) -> String {
+        guard showsBadge(folder), let unseen = folder.unseen, unseen > 0 else { return folder.title }
+        return "\(folder.title): \(unseen.formatted()) unread"
     }
 
     private func showsBadge(_ folder: ReaderFolder) -> Bool {
         folder.kind == .inbox || folder.kind == .other || folder.kind == .spam
+    }
+}
+
+/// The open folder (message list and reader) or the mailbox's settings, shown in the window's detail column.
+struct MailboxPaneDetail: View {
+    @EnvironmentObject private var appState: AppState
+    let account: MailAccount
+    let pane: MailboxPane?
+
+    var body: some View {
+        switch MailboxPane.resolved(pane, folders: appState.mailFolders(for: account)) {
+        case .settings:
+            AccountDetailView(account: account)
+        case .folder(let name):
+            MailboxReaderView(account: account, folder: name)
+                .id("\(account.id)|\(name)")
+        }
     }
 }
