@@ -27,16 +27,17 @@ struct MCPToolInfo: Identifiable, Hashable, Sendable {
 enum MCPToolCatalog {
     static let all: [MCPToolInfo] = [
         MCPToolInfo(name: "list_accounts", title: "List accounts", intro: "Shows mailboxes in the active vault, or all unlocked vaults if that setting is on.", audience: .readOnly),
-        MCPToolInfo(name: "search_messages", title: "Search messages", intro: "Finds messages by text or from:/to:/subject:.", audience: .readOnly),
-        MCPToolInfo(name: "get_message", title: "Get message", intro: "Reads one message body, headers, and attachment names.", audience: .readOnly),
+        MCPToolInfo(name: "probe_accounts", title: "Probe accounts", intro: "Fast connection check and Spam/Trash folder names. Does not count every folder.", audience: .readOnly),
+        MCPToolInfo(name: "search_messages", title: "Search messages", intro: "Finds messages across accounts, including Spam and Trash when mailbox=everywhere.", audience: .readOnly),
+        MCPToolInfo(name: "get_message", title: "Get message", intro: "Reads one message body. Use the message_id from search; Spam and Trash mail open correctly. Does not mark read.", audience: .readOnly),
         MCPToolInfo(name: "get_thread", title: "Get thread", intro: "Reads a conversation in date order.", audience: .readOnly),
         MCPToolInfo(name: "list_threads", title: "List threads", intro: "Groups matching messages into conversations.", audience: .readOnly),
-        MCPToolInfo(name: "list_folders", title: "List folders", intro: "Counts messages and unread mail in each folder.", audience: .readOnly),
+        MCPToolInfo(name: "list_folders", title: "List folders", intro: "Lists folders. Counts are optional and slow; omit them unless needed.", audience: .readOnly),
         MCPToolInfo(name: "inbox_digest", title: "Inbox digest", intro: "Unread, aging threads, top senders, and snoozed mail.", audience: .readOnly),
         MCPToolInfo(name: "list_contacts", title: "List contacts", intro: "People you write to most, from Sent mail.", audience: .readOnly),
         MCPToolInfo(name: "suggest_recipients", title: "Suggest recipients", intro: "Autocomplete addresses from recent Sent mail.", audience: .readOnly),
         MCPToolInfo(name: "list_drafts", title: "List drafts", intro: "Shows drafts waiting in the mailbox.", audience: .readOnly),
-        MCPToolInfo(name: "get_attachment", title: "Get attachment", intro: "Downloads one attachment as base64.", audience: .readOnly),
+        MCPToolInfo(name: "get_attachment", title: "Get attachment", intro: "Downloads one attachment as base64. Pass the same message_id returned by search or get_message.", audience: .readOnly),
         MCPToolInfo(name: "list_pending_sends", title: "List pending sends", intro: "Outbound mail waiting for your confirmation.", audience: .readOnly),
 
         MCPToolInfo(name: "import_imap_file", title: "Import IMAP file", intro: "Adds IMAP mailboxes from a local email/password text file. Skips addresses already in the vault.", audience: .mailboxAdd),

@@ -221,6 +221,10 @@ enum Paths {
         applicationSupport.appendingPathComponent("tool-history.json")
     }
 
+    static var mailboxCacheDirectory: URL {
+        applicationSupport.appendingPathComponent("cache", isDirectory: true)
+    }
+
     static func localVaultURL(id: UUID) -> URL {
         applicationSupport
             .appendingPathComponent("vaults", isDirectory: true)

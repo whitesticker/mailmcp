@@ -17,24 +17,92 @@ final class GmailProvider: MailProviding, @unchecked Sendable {
         return "Gmail OK — \(email)"
     }
 
-    func listFolders() async throws -> [MailFolderCount] {
+    func fetchWatermark() async throws -> String {
+        let profile = try await getJSON(path: "users/me/profile")
+        if let historyID = profile["historyId"] as? String {
+            return "gmail:h=\(historyID)"
+        }
+        if let historyNum = profile["historyId"] as? NSNumber {
+            return "gmail:h=\(historyNum.stringValue)"
+        }
+        let total = profile["messagesTotal"] as? Int ?? 0
+        return "gmail:m=\(total)"
+    }
+
+    func listFolders(includeCounts: Bool) async throws -> [MailFolderCount] {
         let json = try await getJSON(path: "users/me/labels")
         let labels = json["labels"] as? [[String: Any]] ?? []
         var result: [MailFolderCount] = []
         for label in labels {
             guard let id = label["id"] as? String, let name = label["name"] as? String else { continue }
-            let detail = try await getJSON(path: "users/me/labels/\(id)")
-            result.append(
-                MailFolderCount(
-                    name: name,
-                    messages: detail["messagesTotal"] as? Int,
-                    unseen: detail["messagesUnread"] as? Int,
-                    selectable: true,
-                    remoteID: id
+            if includeCounts {
+                let detail = try await getJSON(path: "users/me/labels/\(id)")
+                result.append(
+                    MailFolderCount(
+                        name: name,
+                        messages: detail["messagesTotal"] as? Int,
+                        unseen: detail["messagesUnread"] as? Int,
+                        selectable: true,
+                        remoteID: id
+                    )
                 )
-            )
+            } else {
+                result.append(
+                    MailFolderCount(
+                        name: name,
+                        messages: label["messagesTotal"] as? Int,
+                        unseen: label["messagesUnread"] as? Int,
+                        selectable: true,
+                        remoteID: id
+                    )
+                )
+            }
         }
         return result
+    }
+
+    func resolveMailboxes(_ requested: [String]) async throws -> [ResolvedMailbox] {
+        let folders = try await listFolders(includeCounts: false)
+        var hints = folders.map { FolderHint(name: $0.name, remoteID: $0.remoteID) }
+        if !hints.contains(where: { $0.kind == .spam }) {
+            hints.append(FolderHint(name: "SPAM", remoteID: "SPAM", kind: .spam))
+        }
+        if !hints.contains(where: { $0.kind == .trash }) {
+            hints.append(FolderHint(name: "TRASH", remoteID: "TRASH", kind: .trash))
+        }
+        if !hints.contains(where: { $0.kind == .inbox }) {
+            hints.append(FolderHint(name: "INBOX", remoteID: "INBOX", kind: .inbox))
+        }
+        let requests = requested.flatMap { MailboxRequest.parse($0) }
+        return MailboxMatcher.resolve(requests, folders: hints)
+    }
+
+    func searchFoldered(_ request: FolderSearchSpec) async throws -> [MailSummary] {
+        let boxes = request.mailboxes
+        let kinds = Set(boxes.map { MailboxMatcher.kind(ofName: $0) })
+        if kinds.isSuperset(of: [.inbox, .spam, .trash]) || boxes.contains(where: { $0.lowercased() == "anywhere" }) {
+            return try await searchGmail(
+                query: gmailQuery(request.query, mailbox: "anywhere", after: request.after, before: request.before),
+                limit: request.limit,
+                mailbox: "anywhere",
+                kind: MailboxKind.other.rawValue
+            )
+        }
+        var hits: [MailSummary] = []
+        for mailbox in boxes {
+            try Task.checkCancellation()
+            let kind = MailboxMatcher.kind(ofName: mailbox)
+            let operatorName = gmailMailboxOperator(mailbox)
+            let found = try await searchGmail(
+                query: gmailQuery(request.query, mailbox: operatorName, after: request.after, before: request.before),
+                limit: request.limit,
+                mailbox: mailbox,
+                kind: kind.rawValue
+            )
+            hits.append(contentsOf: found)
+            if hits.count >= request.limit { break }
+        }
+        return Array(hits.prefix(max(request.limit, 1)))
     }
 
     func messageCount(query: String) async throws -> Int {
@@ -50,18 +118,7 @@ final class GmailProvider: MailProviding, @unchecked Sendable {
     }
 
     func search(query: String, limit: Int) async throws -> [MailSummary] {
-        var path = "users/me/messages?maxResults=\(min(max(limit, 1), 50))"
-        if !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            path += "&q=\(query.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? query)"
-        }
-        let json = try await getJSON(path: path)
-        let messages = json["messages"] as? [[String: Any]] ?? []
-        var summaries: [MailSummary] = []
-        for item in messages {
-            guard let id = item["id"] as? String else { continue }
-            summaries.append(try await summary(id: id))
-        }
-        return summaries
+        try await searchGmail(query: query, limit: limit, mailbox: nil, kind: nil)
     }
 
     func getMessage(id: String) async throws -> MailMessage {
@@ -236,11 +293,70 @@ final class GmailProvider: MailProviding, @unchecked Sendable {
         )
     }
 
+    private func searchGmail(query: String, limit: Int, mailbox: String?, kind: String?) async throws -> [MailSummary] {
+        var path = "users/me/messages?maxResults=\(min(max(limit, 1), 50))"
+        if !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            path += "&q=\(query.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? query)"
+        }
+        let json = try await getJSON(path: path)
+        let messages = json["messages"] as? [[String: Any]] ?? []
+        var summaries: [MailSummary] = []
+        for item in messages {
+            guard let id = item["id"] as? String else { continue }
+            var row = try await summary(id: id)
+            if row.mailbox == nil { row.mailbox = mailbox }
+            if row.mailboxKind == nil { row.mailboxKind = kind }
+            summaries.append(row)
+        }
+        return summaries
+    }
+
+    private func gmailQuery(_ text: String, mailbox: String?, after: Date?, before: Date?) -> String {
+        var parts: [String] = []
+        if let mailbox, !mailbox.isEmpty {
+            parts.append("in:\(mailbox)")
+        }
+        if let after {
+            parts.append("after:\(MailSearchQuery.gmailDate(after))")
+        }
+        if let before {
+            parts.append("before:\(MailSearchQuery.gmailDate(before))")
+        }
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmed.isEmpty { parts.append(trimmed) }
+        return parts.joined(separator: " ")
+    }
+
+    private func gmailMailboxOperator(_ mailbox: String) -> String {
+        switch MailboxMatcher.kind(ofName: mailbox) {
+        case .spam: return "spam"
+        case .trash: return "trash"
+        case .inbox: return "inbox"
+        case .all: return "all"
+        case .drafts: return "drafts"
+        case .sent: return "sent"
+        default:
+            if mailbox.lowercased() == "anywhere" { return "anywhere" }
+            return mailbox
+        }
+    }
+
+    private func mailboxName(from labels: [String]) -> String? {
+        let upper = labels.map { $0.uppercased() }
+        if upper.contains("SPAM") { return "SPAM" }
+        if upper.contains("TRASH") { return "TRASH" }
+        if upper.contains("INBOX") { return "INBOX" }
+        if upper.contains("DRAFT") { return "DRAFT" }
+        if upper.contains("SENT") { return "SENT" }
+        return labels.first { $0 != "UNREAD" && $0 != "IMPORTANT" && $0 != "STARRED" && $0 != "CATEGORY_PERSONAL" }
+    }
+
     private func summary(id: String) async throws -> MailSummary {
         let json = try await getJSON(path: "users/me/messages/\(id)?format=metadata&metadataHeaders=From&metadataHeaders=To&metadataHeaders=Subject&metadataHeaders=Date")
         let payload = json["payload"] as? [String: Any]
         let headers = headerMap(payload?["headers"] as? [[String: Any]])
         let labels = json["labelIds"] as? [String] ?? []
+        let mailbox = mailboxName(from: labels)
         return MailSummary(
             id: id,
             accountID: account.id,
@@ -252,7 +368,9 @@ final class GmailProvider: MailProviding, @unchecked Sendable {
             date: epochMillis(json["internalDate"]),
             snippet: json["snippet"] as? String ?? "",
             isUnread: labels.contains("UNREAD"),
-            labels: labels
+            labels: labels,
+            mailbox: mailbox,
+            mailboxKind: MailboxMatcher.kind(ofName: mailbox ?? "").rawValue
         )
     }
 
@@ -276,7 +394,9 @@ final class GmailProvider: MailProviding, @unchecked Sendable {
             bodyHTML: extracted.html,
             isUnread: labels.contains("UNREAD"),
             labels: labels,
-            attachments: extracted.attachments
+            attachments: extracted.attachments,
+            mailbox: mailboxName(from: labels),
+            mailboxKind: MailboxMatcher.kind(ofName: mailboxName(from: labels) ?? "").rawValue
         )
     }
 

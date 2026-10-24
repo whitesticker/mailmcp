@@ -17,19 +17,83 @@ final class GraphProvider: MailProviding, @unchecked Sendable {
         return "Microsoft Graph OK — \(email)"
     }
 
-    func listFolders() async throws -> [MailFolderCount] {
+    func fetchWatermark() async throws -> String {
+        let json = try await getJSON(path: "me/mailFolders/inbox?$select=totalItemCount,unreadItemCount")
+        let total = json["totalItemCount"] as? Int ?? 0
+        let unread = json["unreadItemCount"] as? Int ?? 0
+        return "graph:m=\(total):u=\(unread)"
+    }
+
+    func listFolders(includeCounts: Bool) async throws -> [MailFolderCount] {
         let json = try await getJSON(path: "me/mailFolders?$top=100")
         let folders = json["value"] as? [[String: Any]] ?? []
         return folders.compactMap { folder in
             guard let name = folder["displayName"] as? String else { return nil }
             return MailFolderCount(
                 name: name,
-                messages: folder["totalItemCount"] as? Int,
-                unseen: folder["unreadItemCount"] as? Int,
+                messages: includeCounts ? folder["totalItemCount"] as? Int : nil,
+                unseen: includeCounts ? folder["unreadItemCount"] as? Int : nil,
                 selectable: true,
                 remoteID: folder["id"] as? String
             )
         }
+    }
+
+    func resolveMailboxes(_ requested: [String]) async throws -> [ResolvedMailbox] {
+        let folders = try await listFolders(includeCounts: false)
+        var hints = folders.map { FolderHint(name: $0.name, remoteID: $0.remoteID) }
+        let wellKnown: [(String, String, MailboxKind)] = [
+            ("Inbox", "inbox", .inbox),
+            ("Junk Email", "junkemail", .spam),
+            ("Deleted Items", "deleteditems", .trash),
+            ("Archive", "archive", .archive)
+        ]
+        for item in wellKnown where !hints.contains(where: { $0.kind == item.2 }) {
+            hints.append(FolderHint(name: item.0, remoteID: item.1, kind: item.2))
+        }
+        let requests = requested.flatMap { MailboxRequest.parse($0) }
+        var resolved = MailboxMatcher.resolve(requests, folders: hints)
+        for index in resolved.indices where resolved[index].name.isEmpty {
+            if resolved[index].kind == MailboxKind.spam.rawValue {
+                resolved[index].name = "Junk Email"
+                resolved[index].remoteID = "junkemail"
+            } else if resolved[index].kind == MailboxKind.trash.rawValue {
+                resolved[index].name = "Deleted Items"
+                resolved[index].remoteID = "deleteditems"
+            } else if resolved[index].kind == MailboxKind.inbox.rawValue {
+                resolved[index].name = "Inbox"
+                resolved[index].remoteID = "inbox"
+            }
+        }
+        return resolved
+    }
+
+    func searchFoldered(_ request: FolderSearchSpec) async throws -> [MailSummary] {
+        if IMAPSearchQuery.looksLikeGmailRaw(request.query) {
+            throw MailMCPError.notImplemented("Outlook does not support Gmail search operators")
+        }
+        var hits: [MailSummary] = []
+        let boxes = request.mailboxes.isEmpty ? ["inbox"] : request.mailboxes
+        for mailbox in boxes {
+            try Task.checkCancellation()
+            let folderID = graphFolderID(mailbox)
+            let kind = MailboxMatcher.kind(ofName: mailbox)
+            let found = try await searchFolder(
+                folderID: folderID,
+                query: request.query,
+                limit: request.limit,
+                mailbox: mailbox,
+                kind: kind.rawValue
+            )
+            let dated = found.filter { summary in
+                if let after = request.after, let date = summary.date, date < after { return false }
+                if let before = request.before, let date = summary.date, date >= before { return false }
+                return true
+            }
+            hits.append(contentsOf: dated)
+            if hits.count >= request.limit { break }
+        }
+        return Array(hits.prefix(max(request.limit, 1)))
     }
 
     func messageCount(query: String) async throws -> Int {
@@ -221,7 +285,9 @@ final class GraphProvider: MailProviding, @unchecked Sendable {
             date: ISO8601DateFormatter().date(from: json["receivedDateTime"] as? String ?? ""),
             snippet: json["bodyPreview"] as? String ?? "",
             isUnread: (json["isRead"] as? Bool) == false,
-            labels: json["categories"] as? [String] ?? []
+            labels: json["categories"] as? [String] ?? [],
+            mailbox: nil,
+            mailboxKind: nil
         )
     }
 
@@ -254,7 +320,9 @@ final class GraphProvider: MailProviding, @unchecked Sendable {
             bodyHTML: type == "html" ? content : nil,
             isUnread: (json["isRead"] as? Bool) == false,
             labels: json["categories"] as? [String] ?? [],
-            attachments: attachments
+            attachments: attachments,
+            mailbox: nil,
+            mailboxKind: nil
         )
     }
 
@@ -276,6 +344,51 @@ final class GraphProvider: MailProviding, @unchecked Sendable {
             return "\(name) <\(address)>"
         }
         return address
+    }
+
+    private func searchFolder(
+        folderID: String,
+        query: String,
+        limit: Int,
+        mailbox: String,
+        kind: String
+    ) async throws -> [MailSummary] {
+        let top = min(max(limit, 1), 50)
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        let path: String
+        if trimmed.isEmpty {
+            path = "me/mailFolders/\(folderID)/messages?$top=\(top)&$orderby=receivedDateTime desc&$select=id,subject,from,toRecipients,receivedDateTime,bodyPreview,isRead,conversationId,categories,parentFolderId"
+        } else if trimmed.lowercased() == "is:unread" || trimmed.lowercased() == "unseen" {
+            path = "me/mailFolders/\(folderID)/messages?$top=\(top)&$filter=isRead eq false&$select=id,subject,from,toRecipients,receivedDateTime,bodyPreview,isRead,conversationId,categories,parentFolderId"
+        } else {
+            let encoded = trimmed.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? trimmed
+            path = "me/mailFolders/\(folderID)/messages?$top=\(top)&$search=%22\(encoded)%22&$select=id,subject,from,toRecipients,receivedDateTime,bodyPreview,isRead,conversationId,categories,parentFolderId"
+        }
+        let json = try await getJSON(path: path)
+        let items = json["value"] as? [[String: Any]] ?? []
+        return items.compactMap { item in
+            guard var row = summary(from: item) else { return nil }
+            row.mailbox = mailbox
+            row.mailboxKind = kind
+            return row
+        }
+    }
+
+    private func graphFolderID(_ mailbox: String) -> String {
+        switch MailboxMatcher.kind(ofName: mailbox) {
+        case .spam: return "junkemail"
+        case .trash: return "deleteditems"
+        case .inbox: return "inbox"
+        case .archive: return "archive"
+        case .sent: return "sentitems"
+        case .drafts: return "drafts"
+        default:
+            let lower = mailbox.lowercased()
+            if ["junkemail", "deleteditems", "inbox", "archive", "sentitems", "drafts"].contains(lower) {
+                return lower
+            }
+            return mailbox.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? mailbox
+        }
     }
 
     private func addresses(_ value: Any?) -> [String] {

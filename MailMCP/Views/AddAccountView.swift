@@ -62,10 +62,7 @@ struct AddAccountView: View {
             case .imap:
                 imapForm
             case .gmail:
-                oauthCopy(
-                    title: "Sign in with Google",
-                    detail: "Uses an installed-app OAuth client (PKCE). Add your Google client ID in Settings, then continue here. Redirect URI: mailmcp://oauth/google"
-                )
+                oauthCopy(title: "Sign in with Google")
             case .outlook:
                 oauthCopy(
                     title: "Sign in with Microsoft",
@@ -117,7 +114,7 @@ struct AddAccountView: View {
         .formStyle(.grouped)
     }
 
-    private func oauthCopy(title: String, detail: String) -> some View {
+    private func oauthCopy(title: String, detail: String? = nil) -> some View {
         VStack(alignment: .leading, spacing: 8) {
             Text(title).font(.headline)
             if editingAccount == nil {
@@ -126,9 +123,11 @@ struct AddAccountView: View {
             if let editingAccount {
                 LabeledContent("Current account", value: editingAccount.email)
             }
-            Text(detail)
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
+            if let detail {
+                Text(detail)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
         }
     }
 
@@ -152,7 +151,10 @@ struct AddAccountView: View {
             case .imap:
                 try await saveIMAP()
             case .gmail:
-                let config = try OAuthClient.google(clientID: appState.settings.googleClientID)
+                let config = try OAuthClient.google(
+                    clientID: appState.settings.googleClientID,
+                    clientSecret: appState.settings.googleClientSecret
+                )
                 let tokens = try await OAuthClient.signIn(config: config)
                 let address = try await GmailUserInfo.email(tokens: tokens)
                 try saveOAuthAccount(provider: .gmail, tokens: tokens, email: address)

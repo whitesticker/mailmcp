@@ -1,6 +1,21 @@
 import AppKit
 import Foundation
+import IOKit.ps
 import SwiftUI
+
+enum PowerState {
+    static func deferReason() -> String? {
+        if ProcessInfo.processInfo.isLowPowerModeEnabled {
+            return "Low Power Mode is on"
+        }
+        if let info = IOPSCopyPowerSourcesInfo()?.takeRetainedValue(),
+           let source = IOPSGetProvidingPowerSourceType(info)?.takeUnretainedValue() as String?,
+           source == kIOPMBatteryPowerKey {
+            return "running on battery"
+        }
+        return nil
+    }
+}
 
 struct VaultMergeSession: Identifiable {
     var id = UUID()
@@ -39,6 +54,10 @@ final class AppState: ObservableObject {
     @Published var mcpToolHistory: [MCPToolCallRecord] = []
     @Published var lastMCPActivity: Date?
     @Published var parkedInMenuBarNotice = false
+    @Published var syncingAccountIDs: Set<UUID> = []
+    @Published var accountSyncProgress: [UUID: String] = [:]
+    @Published var cacheRevision: Int = 0
+    @Published var autoSyncPausedReason: String?
 
     var mcpAgentCount: Int { mcpAgents.count }
 
@@ -47,6 +66,8 @@ final class AppState: ObservableObject {
     private var stores: [UUID: VaultStore] = [:]
     private var watchers: [UUID: VaultSyncWatcher] = [:]
     private var syncDebounce: Task<Void, Never>?
+    private var cacheObserver: NSObjectProtocol?
+    private var autoSyncTask: Task<Void, Never>?
 
     var vaultExists: Bool {
         !registry.vaults.isEmpty || FileManager.default.fileExists(atPath: Paths.defaultVaultURL.path)
@@ -95,6 +116,15 @@ final class AppState: ObservableObject {
         pendingSends = PendingSendStore.load()
         if registry.persistToolHistory {
             mcpToolHistory = Array(ToolHistoryStore.load().prefix(toolHistoryLimit))
+        }
+        cacheObserver = NotificationCenter.default.addObserver(
+            forName: .mailboxCacheDidChange,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.cacheRevision &+= 1
+            }
         }
     }
 
@@ -338,6 +368,7 @@ final class AppState: ObservableObject {
         accounts = []
         statusMessage = "Vault locked."
         stopAllWatchers()
+        stopAutoSyncScheduler()
     }
 
     func forgetDeviceKey() throws {
@@ -480,6 +511,7 @@ final class AppState: ObservableObject {
         try store.mutate { payload in
             payload.accounts.removeAll { $0.id == id }
         }
+        MailboxCacheStore.shared.clearAll(accountID: id)
         applyUnlockedState()
     }
 
@@ -673,13 +705,203 @@ final class AppState: ObservableObject {
     }
 
     func provider(for account: MailAccount) throws -> any MailProviding {
-        try MailProviderFactory.make(account: account) { [weak self] tokens in
+        let base = try MailProviderFactory.make(account: account) { [weak self] tokens in
             self?.updateTokens(accountID: account.id, tokens: tokens)
         }
+        let policy = settings(for: account).cachePolicy
+        return CachedMailProvider(account: account, base: base, policy: policy)
+    }
+
+    func setAccountSyncing(_ accountID: UUID, isSyncing: Bool) {
+        if isSyncing {
+            syncingAccountIDs.insert(accountID)
+        } else {
+            syncingAccountIDs.remove(accountID)
+            accountSyncProgress.removeValue(forKey: accountID)
+        }
+        cacheRevision &+= 1
+    }
+
+    func setAccountSyncProgress(_ accountID: UUID, message: String?) {
+        if let message, !message.isEmpty {
+            accountSyncProgress[accountID] = message
+        } else {
+            accountSyncProgress.removeValue(forKey: accountID)
+        }
+        cacheRevision &+= 1
+    }
+
+    func syncProgressMessage(for account: MailAccount) -> String? {
+        accountSyncProgress[account.id]
+    }
+
+    func isSyncingCache(for account: MailAccount) -> Bool {
+        syncingAccountIDs.contains(account.id)
+    }
+
+    func pauseMailboxSync(account: MailAccount) {
+        Task {
+            await MailboxSyncCoordinator.shared.cancelSync(accountID: account.id)
+        }
+    }
+
+    func updateAccountSync(accountID: UUID, _ change: (inout MailAccount) -> Void) {
+        guard let store = try? storeOwning(accountID: accountID) else { return }
+        try? store.mutate { payload in
+            if let index = payload.accounts.firstIndex(where: { $0.id == accountID }) {
+                change(&payload.accounts[index])
+            }
+        }
+        applyUnlockedState(preserveStatus: true)
+    }
+
+    // MARK: - Auto-sync scheduler
+
+    private var allUnlockedAccounts: [MailAccount] {
+        stores.values.compactMap(\.payload).flatMap(\.accounts)
+    }
+
+    func nextAutoSyncDate(for account: MailAccount) -> Date? {
+        guard account.syncScope != .off, let interval = account.syncSchedule.interval else { return nil }
+        guard let last = MailboxCacheStore.shared.accountWatermark(accountID: account.id).lastSyncedAt else {
+            return Date()
+        }
+        return last.addingTimeInterval(interval)
+    }
+
+    private func startAutoSyncScheduler() {
+        guard autoSyncTask == nil else { return }
+        autoSyncTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 5_000_000_000)
+            while !Task.isCancelled {
+                await self?.runAutoSyncTick()
+                try? await Task.sleep(nanoseconds: 30_000_000_000)
+            }
+        }
+    }
+
+    private func stopAutoSyncScheduler() {
+        autoSyncTask?.cancel()
+        autoSyncTask = nil
+        autoSyncPausedReason = nil
+    }
+
+    /// Starts at most one due mailbox per tick so mailboxes don't all hit the network at once.
+    private func runAutoSyncTick() async {
+        guard isUnlocked else { return }
+        let scheduled = allUnlockedAccounts.filter { $0.syncScope != .off && $0.syncSchedule != .manual }
+        guard !scheduled.isEmpty else {
+            autoSyncPausedReason = nil
+            return
+        }
+        let wantsPowerCheck = scheduled.contains { settings(for: $0).cachePolicy.pauseAutoSyncOnBattery }
+        let deferReason = wantsPowerCheck ? PowerState.deferReason() : nil
+        if autoSyncPausedReason != deferReason {
+            autoSyncPausedReason = deferReason
+        }
+        let now = Date()
+        for account in scheduled {
+            let policy = settings(for: account).cachePolicy
+            if deferReason != nil && policy.pauseAutoSyncOnBattery { continue }
+            guard let due = nextAutoSyncDate(for: account), due <= now,
+                  !syncingAccountIDs.contains(account.id),
+                  await !MailboxSyncCoordinator.shared.isSyncing(accountID: account.id),
+                  let base = try? MailProviderFactory.make(account: account, onTokens: { [weak self] tokens in
+                      self?.updateTokens(accountID: account.id, tokens: tokens)
+                  }) else { continue }
+            Task {
+                await MailboxSyncCoordinator.shared.scheduledSync(
+                    account: account,
+                    provider: base,
+                    policy: policy,
+                    store: .shared
+                )
+            }
+            break
+        }
+    }
+
+    private func refreshProactiveAccounts() {
+        let ids = Set(allUnlockedAccounts.filter { $0.syncScope != .off }.map(\.id))
+        Task {
+            await MailboxSyncCoordinator.shared.setProactiveAccounts(ids)
+        }
+    }
+
+    func lazyCacheSizeBytes() -> Int64 {
+        _ = cacheRevision
+        let protected = Set(allUnlockedAccounts.filter { $0.syncScope != .off }.map(\.id))
+        return MailboxCacheStore.shared.lazyCacheSizeBytes(excluding: protected)
+    }
+
+    func trimLazyCacheNow() {
+        let policy = settings.cachePolicy
+        Task {
+            await MailboxSyncCoordinator.shared.enforceLazyCacheCap(policy: policy, store: .shared, force: true)
+            await MainActor.run { self.cacheRevision &+= 1 }
+        }
+    }
+
+    func cacheStats(for account: MailAccount) -> AccountCacheStats {
+        _ = cacheRevision
+        return MailboxCacheStore.shared.accountStats(accountID: account.id)
+    }
+
+    func syncMailboxCacheNow(account: MailAccount) async {
+        let policy = settings(for: account).cachePolicy
+        guard account.syncScope != .off,
+              let base = try? MailProviderFactory.make(account: account, onTokens: { [weak self] tokens in
+                  self?.updateTokens(accountID: account.id, tokens: tokens)
+              }) else { return }
+        await MailboxSyncCoordinator.shared.syncNow(
+            account: account,
+            provider: base,
+            policy: policy,
+            store: .shared
+        )
+        cacheRevision &+= 1
+    }
+
+    func clearMailboxCache(account: MailAccount) {
+        MailboxCacheStore.shared.clearAll(accountID: account.id)
+        Task {
+            await MailboxSyncCoordinator.shared.resetCooldown(accountID: account.id)
+        }
+        cacheRevision &+= 1
+        statusMessage = "Cleared cache for \(account.email)."
+    }
+
+    func syncMailboxCacheNow() async {
+        for account in allUnlockedAccounts where account.syncScope != .off {
+            await syncMailboxCacheNow(account: account)
+        }
+    }
+
+    func clearMailboxCache() {
+        MailboxCacheStore.shared.clearAll()
+        Task {
+            await MailboxSyncCoordinator.shared.resetCooldown()
+        }
+        statusMessage = "Mailbox cache cleared."
     }
 
     func resolveAccount(idOrEmail: String?) throws -> MailAccount {
         try ExposedAccountResolver.resolve(idOrEmail: idOrEmail, accounts: exposedAccounts())
+    }
+
+    func resolveAccounts(ids: [String]) throws -> [MailAccount] {
+        let exposed = exposedAccounts()
+        guard !exposed.isEmpty else { throw MailMCPError.accountNotFound }
+        if ids.isEmpty { return exposed }
+        var seen = Set<UUID>()
+        var result: [MailAccount] = []
+        for id in ids {
+            let account = try ExposedAccountResolver.resolve(idOrEmail: id, accounts: exposed)
+            if seen.insert(account.id).inserted {
+                result.append(account)
+            }
+        }
+        return result
     }
 
     func vaultName(for account: MailAccount) -> String {
@@ -859,6 +1081,8 @@ final class AppState: ObservableObject {
         }
         startWatchers()
         consumePendingIMAPImportIfNeeded()
+        refreshProactiveAccounts()
+        startAutoSyncScheduler()
     }
 
     private var isConsumingIMAPImport = false

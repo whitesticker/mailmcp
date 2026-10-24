@@ -1,6 +1,7 @@
 .DS_Store
 DerivedData/
 .derived
+.derived-test/
 *.zip
 .cursor/
 default.profraw

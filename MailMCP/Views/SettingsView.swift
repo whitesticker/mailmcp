@@ -4,6 +4,7 @@ import UniformTypeIdentifiers
 
 private enum SettingsPane: String, CaseIterable, Identifiable {
     case safety
+    case cache
     case oauth
     case vault
     case mcp
@@ -13,6 +14,7 @@ private enum SettingsPane: String, CaseIterable, Identifiable {
     var title: String {
         switch self {
         case .safety: return "Safety"
+        case .cache: return "Cache"
         case .oauth: return "OAuth"
         case .vault: return "Vault"
         case .mcp: return "MCP"
@@ -22,6 +24,7 @@ private enum SettingsPane: String, CaseIterable, Identifiable {
     var icon: String {
         switch self {
         case .safety: return "lock.shield"
+        case .cache: return "internaldrive"
         case .oauth: return "key"
         case .vault: return "externaldrive"
         case .mcp: return "terminal"
@@ -41,6 +44,8 @@ struct SettingsView: View {
     @State private var showMergeImporter = false
     @State private var unlockTarget: UUID?
     @State private var unlockPassphrase = ""
+    @State private var cacheStats = MailboxCacheStore.shared.stats()
+    @State private var isSyncingCache = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -48,6 +53,8 @@ struct SettingsView: View {
                 switch pane {
                 case .safety:
                     safetyForm
+                case .cache:
+                    cacheForm
                 case .oauth:
                     oauthForm
                 case .vault:
@@ -114,13 +121,160 @@ struct SettingsView: View {
         .formStyle(.grouped)
     }
 
+    private var cacheForm: some View {
+        Form {
+            Section("Lazy Caching") {
+                Toggle("Cache what agents read (lazy caching)", isOn: cacheEnabledBinding)
+                Text("Every mailbox saves the searches and messages agents request, so repeat requests are answered locally. Turning this off sends uncached requests to the server; mailboxes with their own background sync still answer from their synced copy.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Picker("Lazy cache size limit", selection: lazyCapBinding) {
+                    Text("256 MB").tag(256)
+                    Text("512 MB").tag(512)
+                    Text("1 GB (Default)").tag(1024)
+                    Text("2 GB").tag(2048)
+                    Text("5 GB").tag(5120)
+                    Text("Unlimited").tag(0)
+                }
+                LabeledContent("Lazy cache in use") {
+                    let used = ByteCountFormatter.string(fromByteCount: appState.lazyCacheSizeBytes(), countStyle: .file)
+                    if let cap = appState.settings.cachePolicy.lazyCacheCapBytes {
+                        Text("\(used) of \(ByteCountFormatter.string(fromByteCount: cap, countStyle: .file))")
+                    } else {
+                        Text(used)
+                    }
+                }
+                Text("When the limit is reached, the least recently opened lazily cached mail is removed first. Mailboxes with background sync are never trimmed.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Section("Server & Bandwidth") {
+                Picker("Server check cooldown", selection: cacheCooldownBinding) {
+                    Text("30 seconds").tag(30)
+                    Text("1 minute (Default)").tag(60)
+                    Text("2 minutes").tag(120)
+                    Text("5 minutes").tag(300)
+                }
+                Picker("Daily download safety cap (per account)", selection: cacheDailyCapBinding) {
+                    Text("500 MB / day").tag(500)
+                    Text("1,000 MB / day").tag(1000)
+                    Text("1,500 MB / day (Default — under Gmail’s 2.5 GB limit)").tag(1500)
+                    Text("2,000 MB / day").tag(2000)
+                }
+                Toggle("Pause auto-sync on battery or Low Power Mode", isOn: pauseOnBatteryBinding)
+                Text("Background sync for individual mailboxes (scope and schedule) is set on each mailbox’s page in the sidebar.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Section("Status & Storage") {
+                LabeledContent("Cached titles / headers", value: "\(cacheStats.messageCount)")
+                LabeledContent("Cached full bodies", value: "\(cacheStats.bodyCount)")
+                LabeledContent("Cached folders", value: "\(cacheStats.folderCount)")
+                LabeledContent("Disk usage", value: ByteCountFormatter.string(fromByteCount: cacheStats.sizeBytes, countStyle: .file))
+                LabeledContent("Last synced") {
+                    if let last = cacheStats.lastSyncAt {
+                        Text(last.formatted(date: .abbreviated, time: .shortened))
+                    } else {
+                        Text("Not synced yet")
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                FlowLayout {
+                    Button(isSyncingCache || !appState.syncingAccountIDs.isEmpty ? "Syncing…" : "Sync all background-synced mailboxes") {
+                        isSyncingCache = true
+                        Task {
+                            await appState.syncMailboxCacheNow()
+                            await MainActor.run {
+                                cacheStats = MailboxCacheStore.shared.stats()
+                                isSyncingCache = false
+                                localStatus = "Mailbox cache synced."
+                            }
+                        }
+                    }
+                    .disabled(isSyncingCache || !appState.syncingAccountIDs.isEmpty || !appState.isUnlocked
+                              || !appState.accounts.contains { $0.syncScope != .off })
+
+                    Button("Trim lazy cache now") {
+                        appState.trimLazyCacheNow()
+                    }
+                    .disabled(appState.settings.cachePolicy.lazyCacheCapBytes == nil)
+
+                    Button("Clear all cache", role: .destructive) {
+                        appState.clearMailboxCache()
+                        cacheStats = MailboxCacheStore.shared.stats()
+                        localStatus = "Mailbox cache cleared."
+                    }
+                }
+            }
+
+            if !appState.accounts.isEmpty {
+                Section("Per-Account Cache") {
+                    ForEach(appState.accounts) { account in
+                        let accStats = appState.cacheStats(for: account)
+                        let syncing = appState.isSyncingCache(for: account)
+                        HStack(alignment: .center, spacing: 10) {
+                            if syncing {
+                                ProgressView()
+                                    .controlSize(.small)
+                            } else {
+                                Circle()
+                                    .fill((accStats.envelopeCount > 0 || accStats.lastSyncedAt != nil) ? Color.green : Color.orange)
+                                    .frame(width: 8, height: 8)
+                            }
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(account.displayName.isEmpty ? account.email : "\(account.displayName) (\(account.email))")
+                                    .font(.subheadline.weight(.medium))
+                                Text(accountSyncSummary(account))
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                Text("\(accStats.envelopeCount) titles · \(accStats.bodyCount) bodies · \(accStats.folderCount) folders")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                if let synced = accStats.lastSyncedAt {
+                                    Text("Last synced \(synced.formatted(date: .abbreviated, time: .shortened))")
+                                        .font(.caption2)
+                                        .foregroundStyle(.tertiary)
+                                } else {
+                                    Text("Not synced yet")
+                                        .font(.caption2)
+                                        .foregroundStyle(.tertiary)
+                                }
+                            }
+                            Spacer()
+                            if account.syncScope != .off {
+                                Button(syncing ? "Syncing…" : "Sync") {
+                                    Task {
+                                        await appState.syncMailboxCacheNow(account: account)
+                                        await MainActor.run {
+                                            cacheStats = MailboxCacheStore.shared.stats()
+                                        }
+                                    }
+                                }
+                                .controlSize(.small)
+                                .disabled(syncing)
+                            }
+                        }
+                        .padding(.vertical, 2)
+                    }
+                }
+            }
+        }
+        .formStyle(.grouped)
+        .onAppear {
+            cacheStats = MailboxCacheStore.shared.stats()
+        }
+        .onChange(of: appState.cacheRevision) { _, _ in
+            cacheStats = MailboxCacheStore.shared.stats()
+        }
+    }
+
     private var oauthForm: some View {
         Form {
             TextField("Google OAuth client ID", text: googleBinding)
+            SecureField("Google OAuth client secret", text: googleSecretBinding)
             TextField("Microsoft Azure client ID", text: microsoftBinding)
-            Text("Desktop / public clients with PKCE. Register redirect URIs mailmcp://oauth/google and mailmcp://oauth/microsoft. Keep the app in testing mode with your own accounts until you verify it.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
         }
         .formStyle(.grouped)
     }
@@ -366,10 +520,68 @@ struct SettingsView: View {
         )
     }
 
+    private var cacheEnabledBinding: Binding<Bool> {
+        Binding(
+            get: { appState.settings.cachePolicy.enabled },
+            set: { value in try? appState.updateSettings { $0.cachePolicy.enabled = value } }
+        )
+    }
+
+    private var lazyCapBinding: Binding<Int> {
+        Binding(
+            get: { appState.settings.cachePolicy.lazyCacheCapMB },
+            set: { value in
+                try? appState.updateSettings { $0.cachePolicy.lazyCacheCapMB = value }
+                appState.trimLazyCacheNow()
+            }
+        )
+    }
+
+    private var pauseOnBatteryBinding: Binding<Bool> {
+        Binding(
+            get: { appState.settings.cachePolicy.pauseAutoSyncOnBattery },
+            set: { value in try? appState.updateSettings { $0.cachePolicy.pauseAutoSyncOnBattery = value } }
+        )
+    }
+
+    private func accountSyncSummary(_ account: MailAccount) -> String {
+        switch account.syncScope {
+        case .off:
+            return "Lazy caching only"
+        case .recent:
+            return "Background sync: latest \(account.syncRecentCount) · \(account.syncSchedule.title)"
+        case .days:
+            return "Background sync: past \(account.syncDaysBack) days · \(account.syncSchedule.title)"
+        case .everything:
+            return "Background sync: everything · \(account.syncSchedule.title)"
+        }
+    }
+
+    private var cacheCooldownBinding: Binding<Int> {
+        Binding(
+            get: { appState.settings.cachePolicy.cooldownSeconds },
+            set: { value in try? appState.updateSettings { $0.cachePolicy.cooldownSeconds = value } }
+        )
+    }
+
+    private var cacheDailyCapBinding: Binding<Int> {
+        Binding(
+            get: { appState.settings.cachePolicy.dailyBandwidthCapMB },
+            set: { value in try? appState.updateSettings { $0.cachePolicy.dailyBandwidthCapMB = value } }
+        )
+    }
+
     private var googleBinding: Binding<String> {
         Binding(
             get: { appState.settings.googleClientID },
             set: { value in try? appState.updateSettings { $0.googleClientID = value } }
+        )
+    }
+
+    private var googleSecretBinding: Binding<String> {
+        Binding(
+            get: { appState.settings.googleClientSecret },
+            set: { value in try? appState.updateSettings { $0.googleClientSecret = value } }
         )
     }
 

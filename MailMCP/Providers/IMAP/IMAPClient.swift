@@ -113,11 +113,14 @@ final class IMAPClient {
 
     func resolveMailbox(_ raw: String?) throws -> String {
         let token = (raw ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-        if token.isEmpty || token.lowercased() == "inbox" { return "INBOX" }
-        let lower = token.lowercased()
-        if ["all", "allmail", "all mail", "[gmail]/all mail"].contains(lower) {
-            return try specialFolder(matching: ["[Gmail]/All Mail", "[Google Mail]/All Mail"], flag: "\\All")
+        if token.isEmpty { return "INBOX" }
+        let folders = (try? listFolders()) ?? []
+        let hints = folders.map { FolderHint(name: $0.name, flags: $0.flags) }
+        let resolved = MailboxMatcher.resolve(MailboxRequest.parse(token), folders: hints)
+        if let name = resolved.first(where: { !$0.name.isEmpty })?.name {
+            return name
         }
+        if token.lowercased() == "inbox" { return "INBOX" }
         return token
     }
 
