@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 @main
@@ -6,6 +7,7 @@ struct MailMCPEntry {
         if CommandLine.arguments.contains("--mcp") {
             MCPShim.run()
         } else {
+            UserDefaults.standard.set("WhenScrolling", forKey: "AppleShowScrollBars")
             MailMCPApp.main()
         }
     }
@@ -19,11 +21,11 @@ struct MailMCPApp: App {
         Window("MailMCP", id: "main") {
             RootView()
                 .environmentObject(appState)
-                .frame(minWidth: 860, minHeight: 560)
                 .onOpenURL { url in
                     _ = OAuthBrowserFlow.handle(url: url)
                 }
         }
+
         MenuBarExtra("MailMCP", systemImage: appState.mcpAgentCount > 0 ? "envelope.fill" : "envelope") {
             MenuBarView()
                 .environmentObject(appState)
@@ -39,11 +41,20 @@ final class MailMCPAppDelegate: NSObject, NSApplicationDelegate {
         MCPSocketHost.shared.start()
         DispatchQueue.main.async {
             Self.closeExtraMainWindows()
+            WindowMorphController.applyInitialSize(isUnlocked: AppState.shared.isUnlocked)
+        }
+    }
+
+    static func mainWindow() -> NSWindow? {
+        NSApp.windows.first { window in
+            window.canBecomeMain && window.identifier?.rawValue != "recent-calls"
         }
     }
 
     static func closeExtraMainWindows() {
-        let mains = NSApp.windows.filter { $0.canBecomeMain }
+        let mains = NSApp.windows.filter { window in
+            window.canBecomeMain && window.identifier?.rawValue != "recent-calls"
+        }
         for extra in mains.dropFirst() {
             extra.close()
         }
@@ -72,7 +83,7 @@ final class MailMCPAppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
-        if let window = NSApp.windows.first(where: \.canBecomeMain) {
+        if let window = Self.mainWindow() {
             window.makeKeyAndOrderFront(nil)
         }
         Self.closeExtraMainWindows()
@@ -80,15 +91,135 @@ final class MailMCPAppDelegate: NSObject, NSApplicationDelegate {
     }
 }
 
+@MainActor
+enum WindowMorphController {
+    static let lockedSize = NSSize(width: 360, height: 420)
+    static let unlockedSize = NSSize(width: 940, height: 620)
+    static let unlockedMinSize = NSSize(width: 860, height: 560)
+
+    static func applyInitialSize(isUnlocked: Bool) {
+        guard let window = MailMCPAppDelegate.mainWindow() else { return }
+        transition(window: window, toUnlocked: isUnlocked, animated: false)
+    }
+
+    static func transition(toUnlocked: Bool, animated: Bool = true) {
+        guard let window = MailMCPAppDelegate.mainWindow() else { return }
+        transition(window: window, toUnlocked: toUnlocked, animated: animated)
+    }
+
+    private static func transition(window: NSWindow, toUnlocked: Bool, animated: Bool) {
+        let targetContentSize = toUnlocked ? unlockedSize : lockedSize
+        if !toUnlocked {
+            window.titlebarAppearsTransparent = true
+            window.titleVisibility = .hidden
+            window.isMovableByWindowBackground = true
+            window.contentMinSize = lockedSize
+            window.contentMaxSize = lockedSize
+        } else {
+            window.titlebarAppearsTransparent = false
+            window.titleVisibility = .visible
+            window.isMovableByWindowBackground = false
+            window.contentMinSize = unlockedMinSize
+            window.contentMaxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
+        }
+
+        let targetFrameRect = window.frameRect(forContentRect: NSRect(origin: .zero, size: targetContentSize))
+        let currentFrame = window.frame
+        var newOrigin = NSPoint(
+            x: round(currentFrame.midX - targetFrameRect.width / 2),
+            y: round(currentFrame.midY - targetFrameRect.height / 2)
+        )
+
+        if let screen = window.screen ?? NSScreen.main {
+            let visible = screen.visibleFrame
+            newOrigin.x = max(visible.minX + 12, min(newOrigin.x, visible.maxX - targetFrameRect.width - 12))
+            newOrigin.y = max(visible.minY + 12, min(newOrigin.y, visible.maxY - targetFrameRect.height - 12))
+        }
+
+        let newFrame = NSRect(origin: newOrigin, size: targetFrameRect.size)
+        window.setFrame(newFrame, display: true, animate: animated)
+    }
+}
+
+private struct BehindWindowBackdrop: NSViewRepresentable {
+    func makeNSView(context: Context) -> NSVisualEffectView {
+        let view = NSVisualEffectView()
+        view.blendingMode = .behindWindow
+        view.material = .fullScreenUI
+        view.state = .active
+        return view
+    }
+
+    func updateNSView(_ nsView: NSVisualEffectView, context: Context) {}
+}
+
+private struct LoginWindowGlass: ViewModifier {
+    let active: Bool
+    let success: Bool
+
+    func body(content: Content) -> some View {
+        if #available(macOS 15.0, *) {
+            content
+                .containerBackground(for: .window) {
+                    if active {
+                        ZStack {
+                            BehindWindowBackdrop()
+                            Color.green
+                                .opacity(success ? 0.38 : 0)
+                                .animation(.easeInOut(duration: 0.3), value: success)
+                        }
+                    } else {
+                        Color(nsColor: .windowBackgroundColor)
+                    }
+                }
+                .toolbarBackgroundVisibility(active ? .hidden : .automatic, for: .windowToolbar)
+        } else {
+            content
+        }
+    }
+}
+
 struct RootView: View {
     @EnvironmentObject private var appState: AppState
+    @State private var showWorkspace = false
+    @State private var unlockTransitionTask: Task<Void, Never>?
 
     var body: some View {
-        Group {
-            if appState.isUnlocked {
+        ZStack {
+            if showWorkspace {
                 ContentView()
+                    .frame(minWidth: 860, idealWidth: 940, maxWidth: .infinity, minHeight: 560, idealHeight: 620, maxHeight: .infinity)
+                    .transition(.opacity.combined(with: .scale(scale: 0.98)))
             } else {
                 OnboardingView()
+                    .frame(width: 360, height: 420)
+                    .transition(.opacity.combined(with: .scale(scale: 1.04)))
+            }
+        }
+        .modifier(LoginWindowGlass(active: !showWorkspace, success: appState.isUnlocked))
+        .onAppear {
+            showWorkspace = appState.isUnlocked
+            DispatchQueue.main.async {
+                WindowMorphController.applyInitialSize(isUnlocked: appState.isUnlocked)
+            }
+        }
+        .onChange(of: appState.isUnlocked) { _, unlocked in
+            unlockTransitionTask?.cancel()
+            if unlocked {
+                unlockTransitionTask = Task { @MainActor in
+                    try? await Task.sleep(nanoseconds: 500_000_000)
+                    guard !Task.isCancelled, appState.isUnlocked else { return }
+                    WindowMorphController.transition(toUnlocked: true, animated: true)
+                    withAnimation(.spring(response: 0.38, dampingFraction: 0.86)) {
+                        showWorkspace = true
+                    }
+                }
+            } else {
+                RecentCallsWindowController.shared.close()
+                withAnimation(.easeInOut(duration: 0.22)) {
+                    showWorkspace = false
+                }
+                WindowMorphController.transition(toUnlocked: false, animated: true)
             }
         }
         .alert("Error", isPresented: Binding(

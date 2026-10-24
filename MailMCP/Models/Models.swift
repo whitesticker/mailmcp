@@ -36,6 +36,188 @@ enum SafetyMode: String, Codable, CaseIterable, Identifiable {
     var allowsSend: Bool { self == .send }
 }
 
+enum CacheSyncMode: String, Codable, CaseIterable, Identifiable, Sendable {
+    case lazy
+    case rollingWindow
+    case timeWindow
+    case fullSync
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .lazy: return "Lazy sync (on-demand when agent calls MCP)"
+        case .rollingWindow: return "Rolling window (latest N messages)"
+        case .timeWindow: return "Past X days"
+        case .fullSync: return "Full mailbox sync"
+        }
+    }
+
+    var isProactive: Bool {
+        self != .lazy
+    }
+}
+
+enum AccountSyncScope: String, Codable, CaseIterable, Identifiable, Sendable {
+    case off
+    case recent
+    case days
+    case everything
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .off: return "Off (lazy caching only)"
+        case .recent: return "Most recent messages"
+        case .days: return "Past X days"
+        case .everything: return "Everything"
+        }
+    }
+
+    var mode: CacheSyncMode {
+        switch self {
+        case .off: return .lazy
+        case .recent: return .rollingWindow
+        case .days: return .timeWindow
+        case .everything: return .fullSync
+        }
+    }
+}
+
+enum AccountSyncSchedule: String, Codable, CaseIterable, Identifiable, Sendable {
+    case manual
+    case every15Minutes
+    case every30Minutes
+    case hourly
+    case every6Hours
+    case daily
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .manual: return "Manual only"
+        case .every15Minutes: return "Every 15 minutes"
+        case .every30Minutes: return "Every 30 minutes"
+        case .hourly: return "Every hour"
+        case .every6Hours: return "Every 6 hours"
+        case .daily: return "Daily"
+        }
+    }
+
+    var interval: TimeInterval? {
+        switch self {
+        case .manual: return nil
+        case .every15Minutes: return 15 * 60
+        case .every30Minutes: return 30 * 60
+        case .hourly: return 3_600
+        case .every6Hours: return 6 * 3_600
+        case .daily: return 86_400
+        }
+    }
+}
+
+struct CacheSyncPolicy: Codable, Hashable, Sendable {
+    /// Global lazy-caching switch; per-account background sync works regardless.
+    var enabled: Bool
+    var mode: CacheSyncMode
+    var rollingCount: Int
+    var daysBack: Int
+    var cooldownSeconds: Int
+    var fullSyncBodies: Bool
+    var dailyBandwidthCapMB: Int
+    /// 0 means unlimited.
+    var lazyCacheCapMB: Int
+    var pauseAutoSyncOnBattery: Bool
+
+    static let `default` = CacheSyncPolicy(
+        enabled: true,
+        mode: .lazy,
+        rollingCount: 500,
+        daysBack: 90,
+        cooldownSeconds: 60,
+        fullSyncBodies: true,
+        dailyBandwidthCapMB: 1500,
+        lazyCacheCapMB: 1024,
+        pauseAutoSyncOnBattery: true
+    )
+
+    init(
+        enabled: Bool = true,
+        mode: CacheSyncMode = .lazy,
+        rollingCount: Int = 500,
+        daysBack: Int = 90,
+        cooldownSeconds: Int = 60,
+        fullSyncBodies: Bool = true,
+        dailyBandwidthCapMB: Int = 1500,
+        lazyCacheCapMB: Int = 1024,
+        pauseAutoSyncOnBattery: Bool = true
+    ) {
+        self.enabled = enabled
+        self.mode = mode
+        self.rollingCount = rollingCount
+        self.daysBack = daysBack
+        self.cooldownSeconds = cooldownSeconds
+        self.fullSyncBodies = fullSyncBodies
+        self.dailyBandwidthCapMB = dailyBandwidthCapMB
+        self.lazyCacheCapMB = lazyCacheCapMB
+        self.pauseAutoSyncOnBattery = pauseAutoSyncOnBattery
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        enabled = try container.decodeIfPresent(Bool.self, forKey: .enabled) ?? true
+        mode = try container.decodeIfPresent(CacheSyncMode.self, forKey: .mode) ?? .lazy
+        rollingCount = try container.decodeIfPresent(Int.self, forKey: .rollingCount) ?? 500
+        daysBack = try container.decodeIfPresent(Int.self, forKey: .daysBack) ?? 90
+        cooldownSeconds = try container.decodeIfPresent(Int.self, forKey: .cooldownSeconds) ?? 60
+        fullSyncBodies = try container.decodeIfPresent(Bool.self, forKey: .fullSyncBodies) ?? true
+        dailyBandwidthCapMB = try container.decodeIfPresent(Int.self, forKey: .dailyBandwidthCapMB) ?? 1500
+        lazyCacheCapMB = try container.decodeIfPresent(Int.self, forKey: .lazyCacheCapMB) ?? 1024
+        pauseAutoSyncOnBattery = try container.decodeIfPresent(Bool.self, forKey: .pauseAutoSyncOnBattery) ?? true
+    }
+
+    var lazyEnabled: Bool { enabled }
+
+    var cacheActive: Bool { enabled || mode.isProactive }
+
+    var lazyCacheCapBytes: Int64? {
+        lazyCacheCapMB > 0 ? Int64(lazyCacheCapMB) * 1_048_576 : nil
+    }
+
+    var targetLimitPerFolder: Int {
+        switch mode {
+        case .lazy:
+            return min(max(rollingCount, 50), 5_000)
+        case .rollingWindow:
+            return min(max(rollingCount, 50), 5_000)
+        case .timeWindow:
+            return 2_500
+        case .fullSync:
+            return 25_000
+        }
+    }
+
+    var cutoffDate: Date? {
+        guard mode == .timeWindow else { return nil }
+        return Date().addingTimeInterval(-Double(max(daysBack, 1)) * 86_400)
+    }
+
+    var dailyBandwidthCapBytes: Int64 {
+        Int64(max(dailyBandwidthCapMB, 100)) * 1_048_576
+    }
+
+    func effective(for account: MailAccount) -> CacheSyncPolicy {
+        var resolved = self
+        resolved.mode = account.syncScope.mode
+        resolved.rollingCount = account.syncRecentCount
+        resolved.daysBack = account.syncDaysBack
+        resolved.fullSyncBodies = account.fullSyncBodies
+        return resolved
+    }
+}
+
 struct OAuthTokens: Codable, Hashable, Sendable {
     var accessToken: String
     var refreshToken: String?
@@ -43,6 +225,7 @@ struct OAuthTokens: Codable, Hashable, Sendable {
     var scopes: [String]
     var tokenEndpoint: String
     var clientID: String
+    var clientSecret: String?
 
     var isAccessTokenExpired: Bool {
         guard let expiresAt else { return true }
@@ -106,6 +289,11 @@ struct MailAccount: Codable, Identifiable, Hashable, Sendable {
     var imap: IMAPSettings?
     var lastError: String?
     var createdAt: Date
+    var syncScope: AccountSyncScope
+    var syncRecentCount: Int
+    var syncDaysBack: Int
+    var syncSchedule: AccountSyncSchedule
+    var fullSyncBodies: Bool
 
     init(
         id: UUID = UUID(),
@@ -115,7 +303,12 @@ struct MailAccount: Codable, Identifiable, Hashable, Sendable {
         oauth: OAuthTokens? = nil,
         imap: IMAPSettings? = nil,
         lastError: String? = nil,
-        createdAt: Date = Date()
+        createdAt: Date = Date(),
+        syncScope: AccountSyncScope = .off,
+        syncRecentCount: Int = 500,
+        syncDaysBack: Int = 90,
+        syncSchedule: AccountSyncSchedule = .manual,
+        fullSyncBodies: Bool = true
     ) {
         self.id = id
         self.provider = provider
@@ -125,6 +318,42 @@ struct MailAccount: Codable, Identifiable, Hashable, Sendable {
         self.imap = imap
         self.lastError = lastError
         self.createdAt = createdAt
+        self.syncScope = syncScope
+        self.syncRecentCount = syncRecentCount
+        self.syncDaysBack = syncDaysBack
+        self.syncSchedule = syncSchedule
+        self.fullSyncBodies = fullSyncBodies
+    }
+
+    private enum LegacyCodingKeys: String, CodingKey {
+        case cacheOverride
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(UUID.self, forKey: .id)
+        provider = try container.decode(MailProviderKind.self, forKey: .provider)
+        email = try container.decode(String.self, forKey: .email)
+        displayName = try container.decodeIfPresent(String.self, forKey: .displayName) ?? ""
+        oauth = try container.decodeIfPresent(OAuthTokens.self, forKey: .oauth)
+        imap = try container.decodeIfPresent(IMAPSettings.self, forKey: .imap)
+        lastError = try container.decodeIfPresent(String.self, forKey: .lastError)
+        createdAt = try container.decodeIfPresent(Date.self, forKey: .createdAt) ?? Date()
+        if let scope = try container.decodeIfPresent(AccountSyncScope.self, forKey: .syncScope) {
+            syncScope = scope
+        } else {
+            let legacy = try decoder.container(keyedBy: LegacyCodingKeys.self)
+            switch try legacy.decodeIfPresent(String.self, forKey: .cacheOverride) {
+            case "rollingWindow": syncScope = .recent
+            case "timeWindow": syncScope = .days
+            case "fullSync": syncScope = .everything
+            default: syncScope = .off
+            }
+        }
+        syncRecentCount = try container.decodeIfPresent(Int.self, forKey: .syncRecentCount) ?? 500
+        syncDaysBack = try container.decodeIfPresent(Int.self, forKey: .syncDaysBack) ?? 90
+        syncSchedule = try container.decodeIfPresent(AccountSyncSchedule.self, forKey: .syncSchedule) ?? .manual
+        fullSyncBodies = try container.decodeIfPresent(Bool.self, forKey: .fullSyncBodies) ?? true
     }
 }
 
@@ -133,16 +362,20 @@ struct AppSettings: Codable, Hashable, Sendable {
     var confirmBeforeSend: Bool
     var syncFolderPath: String?
     var googleClientID: String
+    var googleClientSecret: String
     var microsoftClientID: String
     var disabledTools: [String]
+    var cachePolicy: CacheSyncPolicy
 
     static let `default` = AppSettings(
         safetyMode: .readOnly,
         confirmBeforeSend: true,
         syncFolderPath: nil,
         googleClientID: "",
+        googleClientSecret: "",
         microsoftClientID: "",
-        disabledTools: []
+        disabledTools: [],
+        cachePolicy: .default
     )
 
     init(
@@ -150,15 +383,19 @@ struct AppSettings: Codable, Hashable, Sendable {
         confirmBeforeSend: Bool,
         syncFolderPath: String?,
         googleClientID: String,
+        googleClientSecret: String = "",
         microsoftClientID: String,
-        disabledTools: [String] = []
+        disabledTools: [String] = [],
+        cachePolicy: CacheSyncPolicy = .default
     ) {
         self.safetyMode = safetyMode
         self.confirmBeforeSend = confirmBeforeSend
         self.syncFolderPath = syncFolderPath
         self.googleClientID = googleClientID
+        self.googleClientSecret = googleClientSecret
         self.microsoftClientID = microsoftClientID
         self.disabledTools = disabledTools
+        self.cachePolicy = cachePolicy
     }
 
     init(from decoder: Decoder) throws {
@@ -167,8 +404,10 @@ struct AppSettings: Codable, Hashable, Sendable {
         confirmBeforeSend = try container.decodeIfPresent(Bool.self, forKey: .confirmBeforeSend) ?? true
         syncFolderPath = try container.decodeIfPresent(String.self, forKey: .syncFolderPath)
         googleClientID = try container.decodeIfPresent(String.self, forKey: .googleClientID) ?? ""
+        googleClientSecret = try container.decodeIfPresent(String.self, forKey: .googleClientSecret) ?? ""
         microsoftClientID = try container.decodeIfPresent(String.self, forKey: .microsoftClientID) ?? ""
         disabledTools = try container.decodeIfPresent([String].self, forKey: .disabledTools) ?? []
+        cachePolicy = try container.decodeIfPresent(CacheSyncPolicy.self, forKey: .cachePolicy) ?? .default
     }
 }
 
@@ -239,6 +478,38 @@ struct MailSummary: Codable, Hashable, Sendable, Identifiable {
     var snippet: String
     var isUnread: Bool
     var labels: [String]
+    var mailbox: String?
+    var mailboxKind: String?
+
+    init(
+        id: String,
+        accountID: UUID,
+        accountEmail: String,
+        threadID: String? = nil,
+        from: String,
+        to: [String],
+        subject: String,
+        date: Date?,
+        snippet: String,
+        isUnread: Bool,
+        labels: [String],
+        mailbox: String? = nil,
+        mailboxKind: String? = nil
+    ) {
+        self.id = id
+        self.accountID = accountID
+        self.accountEmail = accountEmail
+        self.threadID = threadID
+        self.from = from
+        self.to = to
+        self.subject = subject
+        self.date = date
+        self.snippet = snippet
+        self.isUnread = isUnread
+        self.labels = labels
+        self.mailbox = mailbox
+        self.mailboxKind = mailboxKind
+    }
 }
 
 struct MailAttachmentMeta: Codable, Hashable, Sendable, Identifiable {
@@ -264,6 +535,8 @@ struct MailMessage: Codable, Hashable, Sendable, Identifiable {
     var isUnread: Bool
     var labels: [String]
     var attachments: [MailAttachmentMeta]
+    var mailbox: String? = nil
+    var mailboxKind: String? = nil
 }
 
 struct MailFolderCount: Codable, Hashable, Sendable, Identifiable {
@@ -415,6 +688,8 @@ enum MailMCPError: LocalizedError {
     case conflict(String)
     case notImplemented(String)
     case ambiguousAccount(String)
+    case timeout(String)
+    case cancelled(String)
 
     var errorDescription: String? {
         switch self {
@@ -432,6 +707,8 @@ enum MailMCPError: LocalizedError {
         case .conflict(let m): return m
         case .notImplemented(let m): return m
         case .ambiguousAccount(let m): return m
+        case .timeout(let m): return m
+        case .cancelled(let m): return m
         }
     }
 }

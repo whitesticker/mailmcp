@@ -17,20 +17,25 @@ enum MailMCPTools {
         ),
         tool(
             "search_messages",
-            "Search messages in a mailbox. IMAP: from:, to:, subject:, in:all. Gmail also supports has:nouserlabels and other web operators via X-GM-RAW.",
+            "Search messages across selected accounts, including Spam/Junk and Trash/Deleted Items. mailbox=everywhere (default) searches inbox, spam, and trash with provider-specific names. Returns a structured result: status is no_matches, partial, incomplete, unsupported, error, or ok. Use the returned message_id to open mail found in Spam or Trash. Does not mark messages read.",
             [
-                "account_id": stringProp("Account UUID or email. Optional if only one account exists."),
-                "query": stringProp("Search query. IMAP: from:, to:, subject:, in:all / in:inbox."),
-                "mailbox": stringProp("Optional folder to search. Use all for Gmail All Mail. Same as in:all."),
-                "limit": numberProp("Maximum messages to return (default 20).")
+                "account_id": stringProp("Account UUID or email. Repeat as comma-separated values, or omit to search every connected account."),
+                "account_ids": arrayProp("Optional list of account UUIDs or emails. Combined with account_id."),
+                "query": stringProp("Search text. IMAP/Gmail: from:, to:, subject:, after:YYYY-MM-DD, before:YYYY-MM-DD, in:spam / in:trash / in:everywhere."),
+                "mailbox": stringProp("Canonical folder: everywhere (default), spam, trash, inbox, all, or a provider folder name. Comma-separated lists are allowed."),
+                "after": stringProp("Optional inclusive start date (YYYY-MM-DD or ISO-8601)."),
+                "before": stringProp("Optional exclusive end date (YYYY-MM-DD or ISO-8601)."),
+                "limit": numberProp("Maximum messages to return (default 20)."),
+                "cursor": stringProp("Pagination cursor from a previous nextCursor."),
+                "timeout_seconds": numberProp("Deadline for the whole search (default 20). Partial results are returned on timeout.")
             ]
         ),
         tool(
             "get_message",
-            "Fetch a single message body, headers, and attachment metadata.",
+            "Fetch a single message body, headers, and attachment metadata. Pass message_id exactly as returned by search_messages so Spam/Trash IMAP mail can be opened. Does not mark the message read.",
             [
                 "account_id": stringProp("Account UUID or email."),
-                "message_id": stringProp("Provider message id or IMAP UID.")
+                "message_id": stringProp("Location-aware id from search_messages, or a provider message id.")
             ],
             required: ["message_id"]
         ),
@@ -48,7 +53,7 @@ enum MailMCPTools {
             "Archive, trash, mark read/unread, or add/remove a label. Requires drafts/organize safety mode.",
             [
                 "account_id": stringProp("Account UUID or email."),
-                "message_id": stringProp("Provider message id or IMAP UID."),
+                "message_id": stringProp("Location-aware id from search_messages, or a provider message id."),
                 "action": enumProp("archive, trash, markRead, markUnread, addLabel, removeLabel"),
                 "label": stringProp("Label/category for addLabel or removeLabel.")
             ],
@@ -82,10 +87,10 @@ enum MailMCPTools {
         ),
         tool(
             "get_attachment",
-            "Download one attachment as base64. Use ids from get_message.",
+            "Download one attachment as base64. Use ids from get_message. Pass the same location-aware message_id so Spam/Trash attachments resolve.",
             [
                 "account_id": stringProp("Account UUID or email."),
-                "message_id": stringProp("Provider message id or IMAP UID."),
+                "message_id": stringProp("Location-aware id from search_messages or get_message."),
                 "attachment_id": stringProp("Attachment id from get_message.")
             ],
             required: ["message_id", "attachment_id"]
@@ -97,9 +102,19 @@ enum MailMCPTools {
         ),
         tool(
             "list_folders",
-            "List mailbox folders with message and unread counts.",
+            "List mailbox folders. Does not fetch message counts unless include_counts=true (slow on IMAP/Gmail). Use probe_accounts for a fast connection check and Spam/Trash names.",
             [
-                "account_id": stringProp("Account UUID or email. Optional if only one account exists.")
+                "account_id": stringProp("Account UUID or email. Optional if only one account exists."),
+                "include_counts": stringProp("true to include message and unread counts. Default false.")
+            ]
+        ),
+        tool(
+            "probe_accounts",
+            "Fast connection diagnostics: ping each selected account and resolve inbox, spam, and trash names. Does not STATUS every folder.",
+            [
+                "account_id": stringProp("Optional account UUID or email. Omit to probe every connected account."),
+                "account_ids": arrayProp("Optional list of account UUIDs or emails."),
+                "timeout_seconds": numberProp("Per-account deadline (default 8).")
             ]
         ),
         tool(
@@ -181,7 +196,7 @@ enum MailMCPTools {
             "Move a message to a folder and/or apply labels. Nobody else is notified.",
             [
                 "account_id": stringProp("Account UUID or email."),
-                "message_id": stringProp("Provider message id or IMAP UID."),
+                "message_id": stringProp("Location-aware id from search_messages, or a provider message id."),
                 "folder": stringProp("Destination folder name, e.g. Applied intuition."),
                 "add_labels": arrayProp("Labels to add."),
                 "remove_labels": arrayProp("Labels to remove.")
@@ -195,7 +210,7 @@ enum MailMCPTools {
                 "account_id": stringProp("Account UUID or email."),
                 "query": stringProp("Required search. IMAP: from:, to:, subject:, in:all. Gmail: has:nouserlabels and other web operators."),
                 "folder": stringProp("Destination folder, e.g. Amazon/Order."),
-                "mailbox": stringProp("Optional source folder. all = Gmail All Mail. Default Inbox."),
+                "mailbox": stringProp("Optional source folder. spam, trash, everywhere, all, or a folder name. Default Inbox."),
                 "limit": numberProp("Optional max messages to file this call. Use 200 for unlabeled Inbox pulls.")
             ],
             required: ["query", "folder"]
@@ -205,7 +220,7 @@ enum MailMCPTools {
             "Hide a message from inbox_digest until a time. Local to this Mac; does not email anyone.",
             [
                 "account_id": stringProp("Account UUID or email."),
-                "message_id": stringProp("Provider message id or IMAP UID."),
+                "message_id": stringProp("Location-aware id from search_messages, or a provider message id."),
                 "until": stringProp("ISO-8601 date or +3d / +12h / +1w. Default +1d.")
             ],
             required: ["message_id"]
@@ -270,28 +285,28 @@ enum MailMCPTools {
         case "list_folders":
             let account = try state.resolveAccount(idOrEmail: string(arguments["account_id"]))
             let mail = try state.provider(for: account)
-            let folders = try await mail.listFolders().sorted {
-                ($0.messages ?? -1) > ($1.messages ?? -1)
+            let includeCounts = bool(arguments["include_counts"])
+            let folders = try await MailDeadline.withTimeout(seconds: includeCounts ? 45 : MailDeadline.probeDefault) {
+                try await mail.listFolders(includeCounts: includeCounts)
             }
+            let sorted = includeCounts
+                ? folders.sorted { ($0.messages ?? -1) > ($1.messages ?? -1) }
+                : folders.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
             return try encode(FolderCensus(
                 account: account.email,
-                folderCount: folders.count,
-                note: "Folder counts can overlap (Gmail All Mail includes Inbox, Sent, etc.).",
-                folders: folders
+                folderCount: sorted.count,
+                includeCounts: includeCounts,
+                note: includeCounts
+                    ? "Folder counts can overlap (Gmail All Mail includes Inbox, Sent, etc.)."
+                    : "Counts omitted. Pass include_counts=true if you need them. Use mailbox=spam/trash/everywhere on search_messages.",
+                folders: sorted
             ))
 
+        case "probe_accounts":
+            return try await probeAccounts(state: state, arguments: arguments)
+
         case "search_messages":
-            let account = try state.resolveAccount(idOrEmail: string(arguments["account_id"]))
-            let mail = try state.provider(for: account)
-            var query = string(arguments["query"]) ?? ""
-            if let mailbox = string(arguments["mailbox"])?.trimmingCharacters(in: .whitespacesAndNewlines),
-               !mailbox.isEmpty,
-               !query.lowercased().contains("in:") {
-                query = query.isEmpty ? "in:\(mailbox)" : "in:\(mailbox) \(query)"
-            }
-            let limit = int(arguments["limit"]) ?? 20
-            let result = try await mail.search(query: query, limit: limit)
-            return try encode(SearchResult(account: account.email, total: result.count, returned: result.count, messages: result))
+            return try await searchMessages(state: state, arguments: arguments)
 
         case "get_message":
             let account = try state.resolveAccount(idOrEmail: string(arguments["account_id"]))
@@ -370,8 +385,7 @@ enum MailMCPTools {
             let account = try state.resolveAccount(idOrEmail: string(arguments["account_id"]))
             let mail = try state.provider(for: account)
             let limit = int(arguments["limit"]) ?? 20
-            let folders = try await mail.listFolders()
-            let inbox = folders.first { $0.name.caseInsensitiveCompare("INBOX") == .orderedSame }
+            let inboxTotal = try? await mail.messageCount(query: "")
             let unread = try await mail.search(query: "is:unread", limit: max(limit, 20)).filter(\.isUnread)
             let snoozedIDs = Set(SnoozeStore.active(accountID: account.id).map(\.messageID))
             let visible = unread.filter { !snoozedIDs.contains($0.id) }
@@ -382,8 +396,8 @@ enum MailMCPTools {
             }
             let digest = InboxDigest(
                 account: account.email,
-                inboxTotal: inbox?.messages ?? unread.count,
-                inboxUnread: inbox?.unseen ?? unread.count,
+                inboxTotal: inboxTotal ?? unread.count,
+                inboxUnread: unread.count,
                 snoozed: snoozedIDs.count,
                 needsReply: Array(visible.prefix(limit)),
                 agingUnread: visible.filter { ($0.date ?? Date()) < weekAgo },
@@ -640,15 +654,110 @@ enum MailMCPTools {
     private struct FolderCensus: Encodable {
         var account: String
         var folderCount: Int
+        var includeCounts: Bool
         var note: String
         var folders: [MailFolderCount]
     }
 
-    private struct SearchResult: Encodable {
+    private static func accountIDs(_ arguments: [String: Any]) -> [String] {
+        var ids = strings(arguments["account_ids"])
+        if let one = string(arguments["account_id"])?.trimmingCharacters(in: .whitespacesAndNewlines), !one.isEmpty {
+            ids.append(contentsOf: one.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) })
+        }
+        return ids.filter { !$0.isEmpty }
+    }
+
+    @MainActor
+    private static func searchMessages(state: AppState, arguments: [String: Any]) async throws -> String {
+        let accounts = try state.resolveAccounts(ids: accountIDs(arguments))
+        let pairs: [(MailAccount, any MailProviding)] = try accounts.map { account in
+            (account, try state.provider(for: account))
+        }
+        let request = MailSearchRequest(
+            query: string(arguments["query"]) ?? "",
+            mailbox: string(arguments["mailbox"])?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "",
+            accountIDs: accounts.map(\.email),
+            after: MailSearchQuery.parseDate(string(arguments["after"]) ?? ""),
+            before: MailSearchQuery.parseDate(string(arguments["before"]) ?? ""),
+            limit: int(arguments["limit"]) ?? 20,
+            skip: SearchCursor.decode(string(arguments["cursor"])),
+            timeout: Double(int(arguments["timeout_seconds"]) ?? Int(MailDeadline.searchDefault))
+        )
+        let result = await MailSearchCoordinator.run(accounts: pairs, request: request)
+        return try encode(result)
+    }
+
+    @MainActor
+    private static func probeAccounts(state: AppState, arguments: [String: Any]) async throws -> String {
+        let accounts = try state.resolveAccounts(ids: accountIDs(arguments))
+        let timeout = Double(int(arguments["timeout_seconds"]) ?? Int(MailDeadline.probeDefault))
+        let gate = MailConcurrencyGate(limit: MailDeadline.accountConcurrency)
+        var rows: [AccountProbe] = []
+        await withTaskGroup(of: AccountProbe.self) { group in
+            for account in accounts {
+                group.addTask {
+                    let started = Date()
+                    do {
+                        return try await gate.withPermit {
+                            try await MailDeadline.withTimeout(seconds: timeout) {
+                                let mail = try await MainActor.run { try state.provider(for: account) }
+                                let ping = try await mail.testConnection()
+                                let resolved = try await mail.resolveMailboxes(["inbox", "spam", "trash"])
+                                return AccountProbe(
+                                    account: account.email,
+                                    accountID: account.id.uuidString,
+                                    provider: account.provider.rawValue,
+                                    status: "ok",
+                                    ping: ping,
+                                    folders: resolved.filter { !$0.name.isEmpty },
+                                    error: nil,
+                                    elapsedMs: Int(Date().timeIntervalSince(started) * 1000)
+                                )
+                            }
+                        }
+                    } catch {
+                        return AccountProbe(
+                            account: account.email,
+                            accountID: account.id.uuidString,
+                            provider: account.provider.rawValue,
+                            status: "error",
+                            ping: nil,
+                            folders: [],
+                            error: error.localizedDescription,
+                            elapsedMs: Int(Date().timeIntervalSince(started) * 1000)
+                        )
+                    }
+                }
+            }
+            for await row in group {
+                rows.append(row)
+            }
+        }
+        rows.sort { $0.account.localizedCaseInsensitiveCompare($1.account) == .orderedAscending }
+        return try encode(
+            AccountProbeResult(
+                status: rows.contains(where: { $0.status != "ok" }) ? (rows.contains(where: { $0.status == "ok" }) ? "partial" : "error") : "ok",
+                accounts: rows,
+                note: "Folder discovery only. Message counts were not fetched."
+            )
+        )
+    }
+
+    private struct AccountProbe: Encodable, Sendable {
         var account: String
-        var total: Int
-        var returned: Int
-        var messages: [MailSummary]
+        var accountID: String
+        var provider: String
+        var status: String
+        var ping: String?
+        var folders: [ResolvedMailbox]
+        var error: String?
+        var elapsedMs: Int
+    }
+
+    private struct AccountProbeResult: Encodable {
+        var status: String
+        var accounts: [AccountProbe]
+        var note: String
     }
 
     private static func encode<T: Encodable>(_ value: T) throws -> String {

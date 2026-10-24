@@ -40,7 +40,7 @@ enum MCPProtocol {
                 ],
                 "serverInfo": [
                     "name": "mailmcp",
-                    "version": "1.2.0"
+                    "version": "1.3.0"
                 ]
             ]
         case "ping":
@@ -99,6 +99,7 @@ final class MCPClientSession: @unchecked Sendable {
     let id = UUID()
     var name = ""
     var version = ""
+    var detectedLauncher: String?
 }
 
 final class MCPMessageBuffer {
@@ -197,40 +198,112 @@ final class MCPMessageBuffer {
     }
 }
 
+final class MCPInflight: @unchecked Sendable {
+    private let writeLock = NSLock()
+    private let write: (Data) -> Void
+    private let tasksLock = NSLock()
+    private var tasks: [String: Task<Void, Never>] = [:]
+
+    init(write: @escaping (Data) -> Void) {
+        self.write = write
+    }
+
+    func reply(_ response: [String: Any]) {
+        writeLock.lock()
+        defer { writeLock.unlock() }
+        MCPProtocol.writeJSON(response, to: write)
+    }
+
+    func start(idKey: String, _ work: @escaping @Sendable () async -> Void) {
+        let task = Task {
+            await work()
+        }
+        tasksLock.lock()
+        tasks[idKey] = task
+        tasksLock.unlock()
+        Task {
+            await task.value
+            tasksLock.lock()
+            tasks[idKey] = nil
+            tasksLock.unlock()
+        }
+    }
+
+    func cancel(_ idKey: String) {
+        tasksLock.lock()
+        let task = tasks[idKey]
+        tasksLock.unlock()
+        task?.cancel()
+    }
+
+    func cancelAll() {
+        tasksLock.lock()
+        let all = Array(tasks.values)
+        tasks.removeAll()
+        tasksLock.unlock()
+        all.forEach { $0.cancel() }
+    }
+
+    static func idKey(_ id: Any?) -> String? {
+        guard let id else { return nil }
+        if let text = id as? String { return text }
+        if let number = id as? NSNumber { return number.stringValue }
+        if let value = id as? Int { return String(value) }
+        if let value = id as? Double { return String(Int(value)) }
+        return String(describing: id)
+    }
+}
+
 enum MCPSession {
-    static func handle(_ data: Data, session: MCPClientSession? = nil, write: @escaping (Data) -> Void, offline: Bool) {
+    static func handle(_ data: Data, session: MCPClientSession? = nil, write: @escaping (Data) -> Void, offline: Bool, inflight: MCPInflight? = nil) {
         guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             return
         }
         let method = object["method"] as? String
         let id = object["id"]
         guard let method else { return }
+
+        let params = object["params"] as? [String: Any] ?? [:]
+        if method == "notifications/cancelled" {
+            if let key = MCPInflight.idKey(params["requestId"]) ?? MCPInflight.idKey(params["request_id"]) {
+                inflight?.cancel(key)
+            }
+            return
+        }
         if method.hasPrefix("notifications/") {
             return
         }
 
-        let params = object["params"] as? [String: Any] ?? [:]
         if method == "initialize", let session {
             let info = params["clientInfo"] as? [String: Any]
-            let name = (info?["name"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            let rawName = (info?["name"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
             let version = (info?["version"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-            session.name = name
+            let resolvedName = MCPCallLog.resolveSessionAgent(
+                clientInfoName: rawName,
+                detectedLauncher: session.detectedLauncher
+            )
+            session.name = resolvedName
             session.version = version
             Task { @MainActor in
-                AppState.shared.mcpAgentDidIdentify(id: session.id, name: name, version: version)
+                AppState.shared.mcpAgentDidIdentify(id: session.id, name: resolvedName, version: version)
             }
         }
 
-        let reply: (Any?, String?) -> Void = { result, error in
-            MCPProtocol.writeJSON(MCPProtocol.encodeResponse(id: id, result: result, error: error), to: write)
+        let send: (Any?, String?) -> Void = { result, error in
+            let target = inflight
+            if let target {
+                target.reply(MCPProtocol.encodeResponse(id: id, result: result, error: error))
+            } else {
+                MCPProtocol.writeJSON(MCPProtocol.encodeResponse(id: id, result: result, error: error), to: write)
+            }
         }
 
         if method == "initialize" || method == "ping" || method == "tools/list" {
             do {
-                reply(try MCPProtocol.dispatchSync(method: method, params: params), nil)
+                send(try MCPProtocol.dispatchSync(method: method, params: params), nil)
             } catch {
                 if id != nil {
-                    reply(nil, error.localizedDescription)
+                    send(nil, error.localizedDescription)
                 }
             }
             return
@@ -238,30 +311,28 @@ enum MCPSession {
 
         if offline {
             if id != nil {
-                reply(nil, MCPProtocol.appRequiredMessage)
+                send(nil, MCPProtocol.appRequiredMessage)
             }
             return
         }
 
-        let semaphore = DispatchSemaphore(value: 0)
-        Task {
+        guard let key = MCPInflight.idKey(id) else { return }
+        let agentName = session?.name ?? ""
+        let runner = inflight ?? MCPInflight(write: write)
+        runner.start(idKey: key) {
             do {
                 let result = try await MCPProtocol.dispatchAsync(
                     method: method,
                     params: params,
-                    agentName: session?.name ?? ""
+                    agentName: agentName
                 )
-                if id != nil {
-                    reply(result, nil)
-                }
+                runner.reply(MCPProtocol.encodeResponse(id: id, result: result, error: nil))
+            } catch is CancellationError {
+                runner.reply(MCPProtocol.encodeResponse(id: id, result: nil, error: "cancelled"))
             } catch {
-                if id != nil {
-                    reply(nil, error.localizedDescription)
-                }
+                runner.reply(MCPProtocol.encodeResponse(id: id, result: nil, error: error.localizedDescription))
             }
-            semaphore.signal()
         }
-        semaphore.wait()
     }
 }
 
@@ -347,10 +418,26 @@ final class MCPSocketHost: @unchecked Sendable {
 
     private func serve(_ fd: Int32) {
         let session = MCPClientSession()
+        if let detected = MCPProcessInspector.detectAgent(forSocketFD: fd) {
+            session.detectedLauncher = detected
+            session.name = detected
+        }
+        let writeToClient: (Data) -> Void = { data in
+            data.withUnsafeBytes { raw in
+                guard let base = raw.baseAddress else { return }
+                _ = Darwin.write(fd, base, data.count)
+            }
+        }
+        let inflight = MCPInflight(write: writeToClient)
+        let initialName = session.name
         Task { @MainActor in
             AppState.shared.mcpAgentDidConnect(id: session.id)
+            if !initialName.isEmpty {
+                AppState.shared.mcpAgentDidIdentify(id: session.id, name: initialName, version: "")
+            }
         }
         defer {
+            inflight.cancelAll()
             Darwin.close(fd)
             Task { @MainActor in
                 AppState.shared.mcpAgentDidDisconnect(id: session.id)
@@ -367,12 +454,7 @@ final class MCPSocketHost: @unchecked Sendable {
             if n == 0 { break }
             buffer.append(Data(chunk.prefix(n)))
             while let message = buffer.nextMessage() {
-                MCPSession.handle(message, session: session, write: { data in
-                    data.withUnsafeBytes { raw in
-                        guard let base = raw.baseAddress else { return }
-                        _ = Darwin.write(fd, base, data.count)
-                    }
-                }, offline: false)
+                MCPSession.handle(message, session: session, write: writeToClient, offline: false, inflight: inflight)
             }
         }
     }

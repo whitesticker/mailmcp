@@ -80,6 +80,14 @@ enum RFC822 {
         return formatter.string(from: Date())
     }
 
+    static func splitMessage(_ raw: String) -> (headers: [String: String], body: String) {
+        let normalized = raw.replacingOccurrences(of: "\r\n", with: "\n").replacingOccurrences(of: "\r", with: "\n")
+        if let range = normalized.range(of: "\n\n") {
+            return (parseHeaders(String(normalized[..<range.lowerBound])), String(normalized[range.upperBound...]))
+        }
+        return (parseHeaders(normalized), "")
+    }
+
     static func addresses(_ value: String?) -> [String] {
         guard let value, !value.isEmpty else { return [] }
         return value.split(separator: ",").map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
