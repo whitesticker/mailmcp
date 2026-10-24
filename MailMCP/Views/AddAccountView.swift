@@ -5,6 +5,8 @@ struct AddAccountView: View {
     @Environment(\.dismiss) private var dismiss
 
     private let editingAccount: MailAccount?
+    /// Shown inside the Settings panel rather than as a sheet: no Cancel, and the form resets after adding.
+    private let inline: Bool
     @State private var kind: MailProviderKind
     @State private var preset: IMAPPreset
     @State private var nickname: String
@@ -17,11 +19,16 @@ struct AddAccountView: View {
     @State private var smtpPort: String
     @State private var imapStartTLS: Bool
     @State private var smtpStartTLS: Bool
+    @State private var syncScope = MailAccount.defaultSyncScope
+    @State private var syncRecentCount = MailAccount.defaultSyncRecentCount
+    @State private var syncDaysBack = 90
     @State private var busy = false
     @State private var error: String?
+    @State private var notice: String?
 
-    init(editingAccount: MailAccount? = nil) {
+    init(editingAccount: MailAccount? = nil, inline: Bool = false) {
         self.editingAccount = editingAccount
+        self.inline = inline
         let settings = editingAccount?.imap
         let matchingPreset = settings.flatMap { saved in
             IMAPPreset.all.first {
@@ -49,50 +56,72 @@ struct AddAccountView: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            Picker("Provider", selection: $kind) {
-                ForEach(MailProviderKind.allCases) { item in
-                    Text(item.title).tag(item)
+        Form {
+            Section {
+                Picker("Provider", selection: $kind) {
+                    ForEach(MailProviderKind.allCases) { item in
+                        Text(item.title).tag(item)
+                    }
                 }
+                .pickerStyle(.segmented)
+                .disabled(editingAccount != nil)
             }
-            .pickerStyle(.segmented)
-            .disabled(editingAccount != nil)
 
             switch kind {
             case .imap:
-                imapForm
+                imapSection
             case .gmail:
-                oauthCopy(title: "Sign in with Google")
+                oauthSection(title: "Sign in with Google")
             case .outlook:
-                oauthCopy(
+                oauthSection(
                     title: "Sign in with Microsoft",
-                    detail: "Uses a public-client OAuth flow (the same PKCE pattern MSAL uses). Add your Azure app ID in Settings. Redirect URI: mailmcp://oauth/microsoft"
+                    detail: "Uses a public-client OAuth flow (the same PKCE pattern MSAL uses). Add your Azure app ID in Settings › OAuth. Redirect URI: mailmcp://oauth/microsoft"
                 )
             }
 
-            if let error {
-                Text(error).foregroundStyle(.red)
+            if editingAccount == nil {
+                Section("Background sync") {
+                    SyncPolicyPickers(scope: $syncScope, recentCount: $syncRecentCount, daysBack: $syncDaysBack)
+                    Text(SyncPolicyPickers.explanation(for: syncScope) + " You can change this later in Mailbox Settings.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
             }
 
-            HStack {
-                Spacer()
-                Button("Cancel") { dismiss() }
-                Button(busy ? "Working…" : editingAccount == nil ? "Continue" : "Save changes") {
-                    Task { await save() }
+            Section {
+                if let notice {
+                    Text(notice).foregroundStyle(.secondary)
                 }
-                .keyboardShortcut(.defaultAction)
-                .disabled(busy)
+                if let error {
+                    Text(error).foregroundStyle(.red)
+                }
+                HStack {
+                    Spacer()
+                    if !inline {
+                        Button("Cancel") { dismiss() }
+                    }
+                    Button(busy ? "Working…" : editingAccount == nil ? (kind == .imap ? "Add Account" : "Continue") : "Save changes") {
+                        Task { await save() }
+                    }
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(busy)
+                }
             }
         }
-        .padding(20)
-        .navigationTitle(editingAccount == nil ? "Add mailbox" : "Modify account")
+        .formStyle(.grouped)
+        .navigationTitle(editingAccount == nil ? "Add an Account" : "Modify account")
         .onChange(of: preset) { _, newValue in
             apply(newValue)
         }
+        .onChange(of: kind) { _, _ in
+            error = nil
+            notice = nil
+        }
     }
 
-    private var imapForm: some View {
-        Form {
+    @ViewBuilder
+    private var imapSection: some View {
+        Section("Account") {
             Picker("Preset", selection: $preset) {
                 ForEach(IMAPPreset.all) { item in
                     Text(item.name).tag(item)
@@ -104,6 +133,8 @@ struct AddAccountView: View {
             TextField("Email", text: $email)
             TextField("Username", text: $username)
             SecureField("Password / app password", text: $password)
+        }
+        Section("Servers") {
             TextField("IMAP host", text: $imapHost)
             TextField("IMAP port", text: $imapPort)
             Toggle("IMAP STARTTLS (use off for implicit TLS on 993)", isOn: $imapStartTLS)
@@ -111,12 +142,10 @@ struct AddAccountView: View {
             TextField("SMTP port", text: $smtpPort)
             Toggle("SMTP STARTTLS (use off for implicit TLS on 465)", isOn: $smtpStartTLS)
         }
-        .formStyle(.grouped)
     }
 
-    private func oauthCopy(title: String, detail: String? = nil) -> some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text(title).font(.headline)
+    private func oauthSection(title: String, detail: String? = nil) -> some View {
+        Section(title) {
             if editingAccount == nil {
                 TextField("Nickname (optional)", text: $nickname)
             }
@@ -125,10 +154,30 @@ struct AddAccountView: View {
             }
             if let detail {
                 Text(detail)
+                    .font(.caption)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
         }
+    }
+
+    private func applySyncPolicy(to account: inout MailAccount) {
+        account.syncScope = syncScope
+        account.syncRecentCount = syncRecentCount
+        account.syncDaysBack = syncDaysBack
+    }
+
+    /// Inline form: confirm and clear the fields so another account can be added.
+    private func finish(added address: String) {
+        guard inline else {
+            dismiss()
+            return
+        }
+        notice = "Added \(address). It’s now in the sidebar."
+        nickname = ""
+        email = ""
+        username = ""
+        password = ""
     }
 
     private func apply(_ preset: IMAPPreset) {
@@ -144,12 +193,15 @@ struct AddAccountView: View {
 
     private func save() async {
         error = nil
+        notice = nil
         busy = true
         defer { busy = false }
         do {
+            let added: String
             switch kind {
             case .imap:
                 try await saveIMAP()
+                added = email.trimmingCharacters(in: .whitespacesAndNewlines)
             case .gmail:
                 let config = try OAuthClient.google(
                     clientID: appState.settings.googleClientID,
@@ -158,13 +210,19 @@ struct AddAccountView: View {
                 let tokens = try await OAuthClient.signIn(config: config)
                 let address = try await GmailUserInfo.email(tokens: tokens)
                 try saveOAuthAccount(provider: .gmail, tokens: tokens, email: address)
+                added = address
             case .outlook:
                 let config = try OAuthClient.microsoft(clientID: appState.settings.microsoftClientID)
                 let tokens = try await OAuthClient.signIn(config: config)
                 let address = try await GraphUserInfo.email(tokens: tokens)
                 try saveOAuthAccount(provider: .outlook, tokens: tokens, email: address)
+                added = address
             }
-            dismiss()
+            if editingAccount == nil {
+                finish(added: added)
+            } else {
+                dismiss()
+            }
         } catch {
             self.error = error.localizedDescription
         }
@@ -189,7 +247,7 @@ struct AddAccountView: View {
             username: username.isEmpty ? address : username,
             password: password
         ).resolvingBlankHosts(for: address)
-        let account = MailAccount(
+        var account = MailAccount(
             id: editingAccount?.id ?? UUID(),
             provider: .imap,
             email: address,
@@ -197,6 +255,9 @@ struct AddAccountView: View {
             imap: settings,
             createdAt: editingAccount?.createdAt ?? Date()
         )
+        if editingAccount == nil {
+            applySyncPolicy(to: &account)
+        }
         _ = try await IMAPProvider(account: account, settings: settings).testConnection()
         if editingAccount == nil {
             try appState.addIMAPAccount(account)
@@ -217,14 +278,64 @@ struct AddAccountView: View {
             ))
         } else {
             try appState.addOAuthAccount(provider: provider, tokens: tokens, email: email)
-            if !nickname.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-               let added = appState.accounts.first(where: {
-                   $0.provider == provider && $0.email.caseInsensitiveCompare(email) == .orderedSame
-               }) {
-                var renamed = added
-                renamed.displayName = nickname.trimmingCharacters(in: .whitespacesAndNewlines)
-                try appState.updateAccount(renamed)
+            if let added = appState.accounts.first(where: {
+                $0.provider == provider && $0.email.caseInsensitiveCompare(email) == .orderedSame
+            }) {
+                var configured = added
+                let trimmedNickname = nickname.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !trimmedNickname.isEmpty {
+                    configured.displayName = trimmedNickname
+                }
+                applySyncPolicy(to: &configured)
+                try appState.updateAccount(configured)
             }
+        }
+    }
+}
+
+/// Policy picker shared by the add-mailbox sheet and Mailbox Settings (see docs/sync-retention.md).
+struct SyncPolicyPickers: View {
+    @Binding var scope: AccountSyncScope
+    @Binding var recentCount: Int
+    @Binding var daysBack: Int
+
+    var body: some View {
+        Picker("Policy", selection: $scope) {
+            ForEach(AccountSyncScope.allCases) { item in
+                Text(item.title).tag(item)
+            }
+        }
+        switch scope {
+        case .recent:
+            Picker("Inbox messages", selection: $recentCount) {
+                Text("250").tag(250)
+                Text("500").tag(500)
+                Text("1,000 (Default)").tag(1000)
+                Text("2,500").tag(2500)
+                Text("5,000").tag(5000)
+            }
+        case .days:
+            Picker("Days", selection: $daysBack) {
+                Text("30 days").tag(30)
+                Text("90 days (Default)").tag(90)
+                Text("180 days").tag(180)
+                Text("365 days").tag(365)
+            }
+        case .off, .everything:
+            EmptyView()
+        }
+    }
+
+    static func explanation(for scope: AccountSyncScope) -> String {
+        switch scope {
+        case .off:
+            return "No background traffic. Only what you or an agent opens or searches is cached."
+        case .recent:
+            return "Keeps the newest Inbox messages cached, headers and bodies. Older mail stays cached until you free space."
+        case .days:
+            return "Keeps recent Inbox mail cached, headers and bodies. Older mail stays cached until you free space."
+        case .everything:
+            return "Caches every folder’s headers, plus text/HTML bodies when enabled. Attachments are never stored."
         }
     }
 }

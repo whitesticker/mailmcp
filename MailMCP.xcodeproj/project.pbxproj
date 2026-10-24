@@ -43,6 +43,7 @@
 		4755F815AFBEEE7580D460BF /* OAuthClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = D4F496757F45C4DEC6799052 /* OAuthClient.swift */; };
 		485C5A77D45AAC57F9B76270 /* FlowLayout.swift in Sources */ = {isa = PBXBuildFile; fileRef = 561948842F91DFE2327CE678 /* FlowLayout.swift */; };
 		D7E1A0010000000000000006 /* ColumnResizeHandle.swift in Sources */ = {isa = PBXBuildFile; fileRef = D7E1A0010000000000000005 /* ColumnResizeHandle.swift */; };
+		D7E1A0010000000000000008 /* CacheLimitSheet.swift in Sources */ = {isa = PBXBuildFile; fileRef = D7E1A0010000000000000007 /* CacheLimitSheet.swift */; };
 		D7E1A0010000000000000004 /* MailboxReaderView.swift in Sources */ = {isa = PBXBuildFile; fileRef = D7E1A0010000000000000003 /* MailboxReaderView.swift */; };
 		D7E1A0010000000000000002 /* MailHTMLView.swift in Sources */ = {isa = PBXBuildFile; fileRef = D7E1A0010000000000000001 /* MailHTMLView.swift */; };
 		4AA10F51FDEC161F76962418 /* VaultStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = F4A1ACCCFF88F025F29274F1 /* VaultStore.swift */; };
@@ -139,6 +140,7 @@
 		5313760CCD7BD7FDA09D59B6 /* MailSearchTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MailSearchTests.swift; sourceTree = "<group>"; };
 		561948842F91DFE2327CE678 /* FlowLayout.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FlowLayout.swift; sourceTree = "<group>"; };
 		D7E1A0010000000000000005 /* ColumnResizeHandle.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ColumnResizeHandle.swift; sourceTree = "<group>"; };
+		D7E1A0010000000000000007 /* CacheLimitSheet.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CacheLimitSheet.swift; sourceTree = "<group>"; };
 		D7E1A0010000000000000003 /* MailboxReaderView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MailboxReaderView.swift; sourceTree = "<group>"; };
 		D7E1A0010000000000000001 /* MailHTMLView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MailHTMLView.swift; sourceTree = "<group>"; };
 		59D78519F4A93A74EBF4BCFB /* Models.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Models.swift; sourceTree = "<group>"; };
@@ -271,6 +273,7 @@
 				7A6B7D6EFD88A2BBA396AF82 /* ContentView.swift */,
 				561948842F91DFE2327CE678 /* FlowLayout.swift */,
 				D7E1A0010000000000000005 /* ColumnResizeHandle.swift */,
+				D7E1A0010000000000000007 /* CacheLimitSheet.swift */,
 				D7E1A0010000000000000003 /* MailboxReaderView.swift */,
 				D7E1A0010000000000000001 /* MailHTMLView.swift */,
 				8614D4C61F1A7C36721078A5 /* MenuBarView.swift */,
@@ -596,6 +599,7 @@
 				51A3304940CD89D654E1E8C5 /* DeviceConfig.swift in Sources */,
 				485C5A77D45AAC57F9B76270 /* FlowLayout.swift in Sources */,
 				D7E1A0010000000000000006 /* ColumnResizeHandle.swift in Sources */,
+				D7E1A0010000000000000008 /* CacheLimitSheet.swift in Sources */,
 				D7E1A0010000000000000004 /* MailboxReaderView.swift in Sources */,
 				D7E1A0010000000000000002 /* MailHTMLView.swift in Sources */,
 				F7643DB0C0F55BF3879051EA /* GmailProvider.swift in Sources */,
@@ -725,7 +729,7 @@
 				GCC_WARN_UNUSED_FUNCTION = YES;
 				GCC_WARN_UNUSED_VARIABLE = YES;
 				GENERATE_INFOPLIST_FILE = NO;
-				MACOSX_DEPLOYMENT_TARGET = 14.0;
+				MACOSX_DEPLOYMENT_TARGET = 15.0;
 				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
 				MTL_FAST_MATH = YES;
 				ONLY_ACTIVE_ARCH = YES;
@@ -749,7 +753,7 @@
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
-				MACOSX_DEPLOYMENT_TARGET = 14.0;
+				MACOSX_DEPLOYMENT_TARGET = 15.0;
 				PRODUCT_BUNDLE_IDENTIFIER = com.mailmcp.mcp;
 				PRODUCT_NAME = "mailmcp-mcp";
 				SDKROOT = macosx;
@@ -783,13 +787,13 @@
 				CODE_SIGN_ENTITLEMENTS = MailMCP/MailMCP.entitlements;
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 4;
+				CURRENT_PROJECT_VERSION = 5;
 				ENABLE_HARDENED_RUNTIME = NO;
 				INFOPLIST_FILE = MailMCP/Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"@executable_path/../Frameworks",
 				);
-				MARKETING_VERSION = 1.3.0;
+				MARKETING_VERSION = 1.4.0;
 				PRODUCT_BUNDLE_IDENTIFIER = com.mailmcp.app;
 				PRODUCT_NAME = MailMCP;
 				SDKROOT = macosx;
@@ -805,13 +809,13 @@
 				CODE_SIGN_ENTITLEMENTS = MailMCP/MailMCP.entitlements;
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 4;
+				CURRENT_PROJECT_VERSION = 5;
 				ENABLE_HARDENED_RUNTIME = NO;
 				INFOPLIST_FILE = MailMCP/Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"@executable_path/../Frameworks",
 				);
-				MARKETING_VERSION = 1.3.0;
+				MARKETING_VERSION = 1.4.0;
 				PRODUCT_BUNDLE_IDENTIFIER = com.mailmcp.app;
 				PRODUCT_NAME = MailMCP;
 				SDKROOT = macosx;
@@ -832,7 +836,7 @@
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
-				MACOSX_DEPLOYMENT_TARGET = 14.0;
+				MACOSX_DEPLOYMENT_TARGET = 15.0;
 				PRODUCT_BUNDLE_IDENTIFIER = com.mailmcp.mcp;
 				PRODUCT_NAME = "mailmcp-mcp";
 				SDKROOT = macosx;
@@ -889,7 +893,7 @@
 				GCC_WARN_UNUSED_FUNCTION = YES;
 				GCC_WARN_UNUSED_VARIABLE = YES;
 				GENERATE_INFOPLIST_FILE = NO;
-				MACOSX_DEPLOYMENT_TARGET = 14.0;
+				MACOSX_DEPLOYMENT_TARGET = 15.0;
 				MTL_ENABLE_DEBUG_INFO = NO;
 				MTL_FAST_MATH = YES;
 				PRODUCT_NAME = "$(TARGET_NAME)";

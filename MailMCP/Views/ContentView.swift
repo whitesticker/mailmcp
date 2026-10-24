@@ -61,11 +61,11 @@ private struct SidebarConfigurator: NSViewRepresentable {
 struct ContentView: View {
     @EnvironmentObject private var appState: AppState
     @State private var selected: ContentSelection?
-    @State private var showAddAccount = false
-    @State private var showAddVault = false
+    @State private var settingsStart: SettingsWorkspaceView.Item = .pane(.safety)
     var body: some View {
         NavigationSplitView(columnVisibility: .constant(.all)) {
             VStack(spacing: 0) {
+                ColumnTitle(text: "MailMCP")
                 List(selection: $selected) {
                     if !appState.pendingSends.isEmpty {
                         Section("Needs confirmation") {
@@ -84,42 +84,21 @@ struct ContentView: View {
                         }
                     }
                 }
-                .navigationTitle("Mailboxes")
                 Divider()
                 List(selection: $selected) {
-                    Button {
-                        showAddAccount = true
-                    } label: {
-                        Label("Add an Account", systemImage: "envelope.badge.plus")
-                    }
-                    .buttonStyle(.plain)
-                    Button {
-                        showAddVault = true
-                    } label: {
-                        Label("Add vault", systemImage: "externaldrive.badge.plus")
-                    }
-                    .buttonStyle(.plain)
-                    Label("Add to an agent", systemImage: "puzzlepiece.extension")
-                        .tag(ContentSelection.agents)
-                    Label("Tool history", systemImage: "clock.arrow.circlepath")
-                        .tag(ContentSelection.history)
                     Label("Settings", systemImage: "gearshape")
                         .tag(ContentSelection.settings)
                 }
                 .scrollDisabled(true)
-                .frame(height: 208)
+                .frame(height: 44)
                 .listStyle(.sidebar)
             }
             .navigationSplitViewColumnWidth(min: 220, ideal: 255, max: 360)
             .background(SidebarConfigurator(minWidth: 220, maxWidth: 360))
             .toolbar(removing: .sidebarToggle)
         } detail: {
-            if selected == .agents {
-                AgentsView()
-            } else if selected == .history {
-                ToolHistoryView()
-            } else if selected == .settings {
-                SettingsView()
+            if selected == .settings {
+                SettingsWorkspaceView(initialItem: settingsStart)
             } else if selected == .pending {
                 PendingSendsView()
             } else if case .account(let id) = selected, let account = appState.account(id: id) {
@@ -130,8 +109,17 @@ struct ContentView: View {
                     Image(systemName: "envelope.open")
                         .font(.system(size: 36))
                         .foregroundStyle(.secondary)
-                    Text(appState.unlockedVaults.flatMap(\.accounts).isEmpty ? "Add a mailbox to get started." : "Select a mailbox.")
-                        .foregroundStyle(.secondary)
+                    if appState.unlockedVaults.flatMap(\.accounts).isEmpty {
+                        Text("Add a mailbox to get started.")
+                            .foregroundStyle(.secondary)
+                        Button("Add an Account…") {
+                            settingsStart = .addAccount
+                            selected = .settings
+                        }
+                    } else {
+                        Text("Select a mailbox.")
+                            .foregroundStyle(.secondary)
+                    }
                     if let status = appState.statusMessage {
                         Text(status)
                             .font(.caption)
@@ -141,118 +129,173 @@ struct ContentView: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         }
-        .sheet(isPresented: $showAddAccount) {
-            AddAccountView()
-                .environmentObject(appState)
-                .frame(minWidth: 520, minHeight: 420)
+        .onChange(of: selected) { _, newValue in
+            if newValue != .settings {
+                settingsStart = .pane(.safety)
+            }
         }
-        .sheet(isPresented: $showAddVault) {
-            AddVaultView()
-                .environmentObject(appState)
-        }
+        .onAppear(perform: consumeSettingsRequest)
+        .onChange(of: appState.pendingSettingsOpen) { _, _ in consumeSettingsRequest() }
+    }
+
+    private func consumeSettingsRequest() {
+        guard appState.pendingSettingsOpen else { return }
+        appState.pendingSettingsOpen = false
+        selected = .settings
     }
 
     private func mailboxRow(_ account: MailAccount) -> some View {
-        let stats = appState.cacheStats(for: account)
-        let isSyncing = appState.isSyncingCache(for: account)
-        let progressText = appState.syncProgressMessage(for: account)
-        let effectivePolicy = appState.settings(for: account).cachePolicy.effective(for: account)
-        let cacheEnabled = effectivePolicy.cacheActive
-
-        return HStack(alignment: .center, spacing: 10) {
-            VStack(alignment: .leading, spacing: 4) {
-                HStack(spacing: 6) {
-                    Text(account.displayName.isEmpty ? account.email : account.displayName)
-                        .font(.headline)
-                        .lineLimit(1)
-                    if let badge = sidebarSyncBadge(account, policy: effectivePolicy) {
-                        Text(badge.title)
-                            .font(.system(size: 9, weight: badge.prominent ? .semibold : .medium))
-                            .padding(.horizontal, 4)
-                            .padding(.vertical, 1)
-                            .background((badge.prominent ? Color.accentColor : Color.secondary).opacity(0.15))
-                            .foregroundStyle(badge.prominent ? Color.accentColor : Color.secondary)
-                            .clipShape(Capsule())
-                    }
-                }
-                Text(account.displayName.isEmpty || account.displayName == account.email
-                     ? account.provider.title
-                     : "\(account.email) · \(account.provider.title)")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+        let status = MailboxStatus(account: account, appState: appState)
+        let hasNickname = !account.displayName.isEmpty && account.displayName != account.email
+        return HStack(alignment: .center, spacing: 8) {
+            MailboxStatusIndicator(status: status)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(hasNickname ? account.displayName : account.email)
+                    .font(.headline)
                     .lineLimit(1)
                     .truncationMode(.middle)
-                HStack(spacing: 5) {
-                    if isSyncing {
-                        ProgressView()
-                            .controlSize(.mini)
-                        Text(progressText ?? "Syncing cache…")
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
-                    } else if !cacheEnabled {
-                        Circle()
-                            .fill(Color.gray.opacity(0.6))
-                            .frame(width: 6, height: 6)
-                        Text("Not cached · requests go to server")
-                            .font(.caption2)
-                            .foregroundStyle(.tertiary)
-                    } else if stats.envelopeCount > 0 || stats.lastSyncedAt != nil {
-                        Circle()
-                            .fill(Color.green)
-                            .frame(width: 6, height: 6)
-                        Text(sidebarCacheSummary(stats))
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
-                    } else if effectivePolicy.mode == .lazy {
-                        Circle()
-                            .fill(Color.blue.opacity(0.75))
-                            .frame(width: 6, height: 6)
-                        Text("Lazy · caches on agent call")
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
-                    } else {
-                        Circle()
-                            .fill(Color.orange.opacity(0.8))
-                            .frame(width: 6, height: 6)
-                        Text("Not synced yet")
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
-                    }
-                }
-                if let error = account.lastError, !error.isEmpty {
-                    Text(error)
-                        .font(.caption2)
-                        .foregroundStyle(.red)
-                        .lineLimit(2)
+                if hasNickname {
+                    Text(account.email)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
         }
+        .padding(.vertical, 2)
+        .help(status.text)
         .tag(ContentSelection.account(account.id))
     }
+}
 
-    private func sidebarSyncBadge(_ account: MailAccount, policy: CacheSyncPolicy) -> (title: String, prominent: Bool)? {
+/// Large bold column heading, like the sidebar title in macOS system apps.
+struct ColumnTitle: View {
+    let text: String
+
+    var body: some View {
+        Text(text)
+            .font(.largeTitle.bold())
+            .lineLimit(1)
+            .minimumScaleFactor(0.6)
+            .truncationMode(.tail)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 16)
+            .padding(.top, 12)
+            .padding(.bottom, 6)
+    }
+}
+
+/// Sync/cache state of a mailbox, shared by the sidebar dot and the mailbox card.
+struct MailboxStatus {
+    enum Kind { case syncing, error, cached, lazy, notSynced }
+
+    let kind: Kind
+    /// One entry per stat, shown on its own line in the mailbox card.
+    let lines: [String]
+    let badge: (title: String, prominent: Bool)?
+
+    var text: String { lines.joined(separator: " · ") }
+
+    @MainActor
+    init(account: MailAccount, appState: AppState) {
+        let stats = appState.cacheStats(for: account)
+        let policy = appState.settings(for: account).cachePolicy.effective(for: account)
         switch account.syncScope {
-        case .off:
-            return policy.lazyEnabled ? ("LAZY", false) : nil
-        case .recent, .days:
-            return (account.syncSchedule == .manual ? "SYNC" : "AUTO", true)
-        case .everything:
-            return ("FULL", true)
+        case .off: badge = ("LAZY", false)
+        case .recent, .days: badge = (account.syncSchedule == .manual ? "SYNC" : "AUTO", true)
+        case .everything: badge = ("FULL", true)
+        }
+        if appState.isSyncingCache(for: account) {
+            kind = .syncing
+            lines = [appState.syncProgressMessage(for: account) ?? "Syncing…"]
+        } else if let error = account.lastError, !error.isEmpty {
+            kind = .error
+            lines = [error]
+        } else if stats.envelopeCount > 0 || stats.lastSyncedAt != nil {
+            kind = .cached
+            var parts = ["\(stats.envelopeCount.formatted()) header\(stats.envelopeCount == 1 ? "" : "s")"]
+            if stats.bodyCount > 0 {
+                parts.append("\(stats.bodyCount.formatted()) bod\(stats.bodyCount == 1 ? "y" : "ies")")
+            }
+            if let synced = stats.lastSyncedAt {
+                parts.append("Synced \(synced.formatted(date: .omitted, time: .shortened))")
+            }
+            lines = parts
+        } else if policy.mode == .lazy {
+            kind = .lazy
+            lines = ["Lazy · caches what you or agents open"]
+        } else {
+            kind = .notSynced
+            lines = ["Not synced yet"]
         }
     }
 
-    private func sidebarCacheSummary(_ stats: AccountCacheStats) -> String {
-        var parts: [String] = ["\(stats.envelopeCount) title\(stats.envelopeCount == 1 ? "" : "s")"]
-        if stats.bodyCount > 0 {
-            parts.append("\(stats.bodyCount) bod\(stats.bodyCount == 1 ? "y" : "ies")")
+    var color: Color {
+        switch kind {
+        case .syncing: return .accentColor
+        case .error: return .red
+        case .cached: return .green
+        case .lazy: return .blue.opacity(0.75)
+        case .notSynced: return .orange.opacity(0.8)
         }
-        if let synced = stats.lastSyncedAt {
-            parts.append(synced.formatted(date: .omitted, time: .shortened))
+    }
+}
+
+struct MailboxStatusIndicator: View {
+    let status: MailboxStatus
+
+    var body: some View {
+        Group {
+            if status.kind == .syncing {
+                ProgressView().controlSize(.mini)
+            } else {
+                Circle().fill(status.color).frame(width: 8, height: 8)
+            }
         }
-        return parts.joined(separator: " · ")
+        .frame(width: 12, height: 12)
+    }
+}
+
+/// Summary card at the top of a mailbox's folder column.
+private struct MailboxInfoCard: View {
+    @EnvironmentObject private var appState: AppState
+    let account: MailAccount
+
+    var body: some View {
+        let status = MailboxStatus(account: account, appState: appState)
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 6) {
+                MailboxStatusIndicator(status: status)
+                if let badge = status.badge {
+                    Text(badge.title)
+                        .font(.system(size: 9, weight: badge.prominent ? .semibold : .medium))
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 1)
+                        .background((badge.prominent ? Color.accentColor : Color.secondary).opacity(0.15))
+                        .foregroundStyle(badge.prominent ? Color.accentColor : Color.secondary)
+                        .clipShape(Capsule())
+                }
+                Text(account.provider.title)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+            ForEach(status.lines, id: \.self) { line in
+                Text(line)
+                    .font(.caption)
+                    .monospacedDigit()
+                    .foregroundStyle(status.kind == .error ? Color.red : Color.secondary)
+                    .lineLimit(status.kind == .error ? 3 : 1)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .padding(.horizontal, 10)
+        .padding(.bottom, 4)
     }
 }
 
@@ -323,39 +366,17 @@ struct AccountDetailView: View {
             }
 
             Section("Background Sync") {
-                Picker("Keep in sync", selection: syncScopeBinding) {
-                    ForEach(AccountSyncScope.allCases) { scope in
-                        Text(scope.title).tag(scope)
-                    }
-                }
-                switch account.syncScope {
-                case .off:
-                    Text(globalPolicy.lazyEnabled
-                         ? "No background traffic. This mailbox only caches what agents search for or open (lazy caching, set in Settings › Cache)."
-                         : "Lazy caching is off in Settings › Cache, so agent requests for this mailbox always go to the server.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                case .recent:
-                    Picker("Messages per folder", selection: syncRecentCountBinding) {
-                        Text("250").tag(250)
-                        Text("500 (Default)").tag(500)
-                        Text("1,000").tag(1000)
-                        Text("2,500").tag(2500)
-                        Text("5,000").tag(5000)
-                    }
-                case .days:
-                    Picker("Time window", selection: syncDaysBackBinding) {
-                        Text("Past 30 days").tag(30)
-                        Text("Past 90 days").tag(90)
-                        Text("Past 180 days").tag(180)
-                        Text("Past 365 days").tag(365)
-                    }
-                case .everything:
+                SyncPolicyPickers(
+                    scope: syncScopeBinding,
+                    recentCount: syncRecentCountBinding,
+                    daysBack: syncDaysBackBinding
+                )
+                if account.syncScope == .everything {
                     Toggle("Download & index all message bodies (text/HTML)", isOn: fullSyncBodiesBinding)
-                    Text("Downloads every folder’s headers plus text/HTML bodies in paced batches. Attachments are fetched only when an agent asks for them.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
                 }
+                Text(SyncPolicyPickers.explanation(for: account.syncScope))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
                 if account.syncScope != .off {
                     Picker("When to sync", selection: syncScheduleBinding) {
                         ForEach(AccountSyncSchedule.allCases) { schedule in
@@ -367,92 +388,6 @@ struct AccountDetailView: View {
                             Text(nextSyncText(now: context.date, policy: globalPolicy))
                                 .foregroundStyle(.secondary)
                         }
-                    }
-                }
-            }
-
-            Section("Local Cache") {
-                LabeledContent("Status") {
-                    HStack(spacing: 6) {
-                        if isSyncing {
-                            ProgressView()
-                                .controlSize(.small)
-                            Text(progressText ?? "Syncing…")
-                        } else if !effectivePolicy.cacheActive {
-                            Circle()
-                                .fill(Color.gray)
-                                .frame(width: 8, height: 8)
-                            Text("Not cached · requests go to server")
-                                .foregroundStyle(.secondary)
-                        } else if let progressText, !progressText.isEmpty {
-                            Circle()
-                                .fill(Color.orange)
-                                .frame(width: 8, height: 8)
-                            Text(progressText)
-                                .foregroundStyle(.secondary)
-                        } else if stats.envelopeCount > 0 || stats.lastSyncedAt != nil {
-                            Circle()
-                                .fill(Color.green)
-                                .frame(width: 8, height: 8)
-                            Text(cooldownStatusText(stats: stats, policy: effectivePolicy))
-                        } else if effectivePolicy.mode == .lazy {
-                            Circle()
-                                .fill(Color.blue)
-                                .frame(width: 8, height: 8)
-                            Text("Lazy · waiting for agent requests")
-                                .foregroundStyle(.secondary)
-                        } else {
-                            Circle()
-                                .fill(Color.orange)
-                                .frame(width: 8, height: 8)
-                            Text("Not synced yet")
-                                .foregroundStyle(.secondary)
-                        }
-                    }
-                }
-                if effectivePolicy.mode == .fullSync && effectivePolicy.fullSyncBodies && stats.envelopeCount > 0 {
-                    LabeledContent("Body mirror progress") {
-                        HStack(spacing: 8) {
-                            ProgressView(
-                                value: Double(min(stats.bodyCount, stats.envelopeCount)),
-                                total: Double(max(stats.envelopeCount, 1))
-                            )
-                            .frame(width: 120)
-                            Text("\(stats.bodyCount) / \(stats.envelopeCount) (\(Int((Double(min(stats.bodyCount, stats.envelopeCount)) / Double(max(stats.envelopeCount, 1))) * 100))%)")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                        }
-                    }
-                }
-                LabeledContent("Cached titles / headers", value: "\(stats.envelopeCount)")
-                LabeledContent("Cached full bodies", value: "\(stats.bodyCount)")
-                LabeledContent("Cached folders", value: "\(stats.folderCount)")
-                LabeledContent("Cached attachments", value: "\(stats.attachmentCount)")
-                LabeledContent("Today’s download usage") {
-                    Text("\(ByteCountFormatter.string(fromByteCount: stats.dailyBandwidthBytes, countStyle: .file)) / \(effectivePolicy.dailyBandwidthCapMB) MB daily safety cap")
-                        .foregroundStyle(.secondary)
-                }
-                if let oldest = stats.oldestMessageAt, let newest = stats.newestMessageAt {
-                    LabeledContent("Cached date span") {
-                        Text("\(oldest.formatted(date: .abbreviated, time: .omitted)) – \(newest.formatted(date: .abbreviated, time: .omitted))")
-                            .foregroundStyle(.secondary)
-                    }
-                }
-                LabeledContent("Last synced") {
-                    if let synced = stats.lastSyncedAt {
-                        Text("\(synced.formatted(date: .abbreviated, time: .shortened)) (\(RelativeDateTimeFormatter().localizedString(for: synced, relativeTo: Date())))")
-                    } else {
-                        Text("Never")
-                            .foregroundStyle(.secondary)
-                    }
-                }
-                LabeledContent("Last server check") {
-                    if let checked = stats.lastCheckedAt {
-                        Text(checked.formatted(date: .abbreviated, time: .standard))
-                            .foregroundStyle(.secondary)
-                    } else {
-                        Text("Never")
-                            .foregroundStyle(.secondary)
                     }
                 }
                 if let cacheNotice {
@@ -488,10 +423,94 @@ struct AccountDetailView: View {
                     .disabled(isSyncing || (stats.envelopeCount == 0 && stats.bodyCount == 0 && stats.folderCount == 0))
                 }
             }
+
+            Section("Local Cache") {
+                LabeledContent("Status") {
+                    HStack(spacing: 6) {
+                        if isSyncing {
+                            ProgressView()
+                                .controlSize(.small)
+                            Text(progressText ?? "Syncing…")
+                        } else if !effectivePolicy.cacheActive {
+                            Circle()
+                                .fill(Color.gray)
+                                .frame(width: 8, height: 8)
+                            Text("Not cached · requests go to server")
+                                .foregroundStyle(.secondary)
+                        } else if let progressText, !progressText.isEmpty {
+                            Circle()
+                                .fill(Color.orange)
+                                .frame(width: 8, height: 8)
+                            Text(progressText)
+                                .foregroundStyle(.secondary)
+                        } else if stats.envelopeCount > 0 || stats.lastSyncedAt != nil {
+                            Circle()
+                                .fill(Color.green)
+                                .frame(width: 8, height: 8)
+                            Text(cooldownStatusText(stats: stats, policy: effectivePolicy))
+                        } else if effectivePolicy.mode == .lazy {
+                            Circle()
+                                .fill(Color.blue)
+                                .frame(width: 8, height: 8)
+                            Text("Lazy · caches what you or agents open")
+                                .foregroundStyle(.secondary)
+                        } else {
+                            Circle()
+                                .fill(Color.orange)
+                                .frame(width: 8, height: 8)
+                            Text("Not synced yet")
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                }
+                if effectivePolicy.mode == .fullSync && effectivePolicy.fullSyncBodies && stats.envelopeCount > 0 {
+                    LabeledContent("Body mirror progress") {
+                        HStack(spacing: 8) {
+                            ProgressView(
+                                value: Double(min(stats.bodyCount, stats.envelopeCount)),
+                                total: Double(max(stats.envelopeCount, 1))
+                            )
+                            .frame(width: 120)
+                            Text("\(stats.bodyCount) / \(stats.envelopeCount) (\(Int((Double(min(stats.bodyCount, stats.envelopeCount)) / Double(max(stats.envelopeCount, 1))) * 100))%)")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                }
+                LabeledContent("Cached titles / headers", value: "\(stats.envelopeCount)")
+                LabeledContent("Cached full bodies", value: "\(stats.bodyCount)")
+                LabeledContent("Cached folders", value: "\(stats.folderCount)")
+                LabeledContent("Today’s download usage") {
+                    Text("\(ByteCountFormatter.string(fromByteCount: stats.dailyBandwidthBytes, countStyle: .file)) / \(effectivePolicy.dailyBandwidthCapMB) MB daily safety cap")
+                        .foregroundStyle(.secondary)
+                }
+                if let oldest = stats.oldestMessageAt, let newest = stats.newestMessageAt {
+                    LabeledContent("Cached date span") {
+                        Text("\(oldest.formatted(date: .abbreviated, time: .omitted)) – \(newest.formatted(date: .abbreviated, time: .omitted))")
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                LabeledContent("Last synced") {
+                    if let synced = stats.lastSyncedAt {
+                        Text("\(synced.formatted(date: .abbreviated, time: .shortened)) (\(RelativeDateTimeFormatter().localizedString(for: synced, relativeTo: Date())))")
+                    } else {
+                        Text("Never")
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                LabeledContent("Last server check") {
+                    if let checked = stats.lastCheckedAt {
+                        Text(checked.formatted(date: .abbreviated, time: .standard))
+                            .foregroundStyle(.secondary)
+                    } else {
+                        Text("Never")
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
         }
         .formStyle(.grouped)
         .navigationTitle(account.displayName.isEmpty ? account.email : account.displayName)
-        .padding()
         .onChange(of: account.id) { _, _ in
             result = nil
             busy = false
@@ -580,8 +599,6 @@ struct AccountDetailView: View {
 }
 
 enum ContentSelection: Hashable {
-    case agents
-    case history
     case settings
     case pending
     case account(UUID)
@@ -623,25 +640,31 @@ struct MailboxWorkspaceView: View {
 
     private var folderList: some View {
         let folders = ReaderFolders.visible(appState.mailFolders(for: account))
-        return List(selection: Binding(get: { current }, set: { pane = $0 })) {
-            Section(account.displayName.isEmpty ? account.email : account.displayName) {
-                if folders.isEmpty {
-                    Label("Inbox", systemImage: "tray")
-                        .tag(Pane.folder("INBOX"))
+        return VStack(spacing: 0) {
+            ColumnTitle(text: account.displayName.isEmpty ? account.email : account.displayName)
+            MailboxInfoCard(account: account)
+            List(selection: Binding(get: { current }, set: { pane = $0 })) {
+                Section {
+                    Label("Mailbox Settings", systemImage: "gearshape")
+                        .tag(Pane.settings)
                 }
-                ForEach(folders) { folder in
-                    Label(folder.title, systemImage: folder.systemImage)
-                        .lineLimit(1)
-                        .badge(showsBadge(folder) ? (folder.unseen ?? 0) : 0)
-                        .tag(Pane.folder(folder.name))
+                Section("Folders") {
+                    if folders.isEmpty {
+                        Label("Inbox", systemImage: "tray")
+                            .tag(Pane.folder("INBOX"))
+                    }
+                    ForEach(folders) { folder in
+                        Label(folder.title, systemImage: folder.systemImage)
+                            .lineLimit(1)
+                            .badge(showsBadge(folder) ? (folder.unseen ?? 0) : 0)
+                            .tag(Pane.folder(folder.name))
+                    }
                 }
             }
-            Section {
-                Label("Mailbox Settings", systemImage: "gearshape")
-                    .tag(Pane.settings)
-            }
+            .listStyle(.sidebar)
+            .scrollContentBackground(.hidden)
         }
-        .listStyle(.sidebar)
+        .background(Color(nsColor: .controlBackgroundColor))
     }
 
     @ViewBuilder

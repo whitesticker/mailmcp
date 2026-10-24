@@ -17,6 +17,18 @@ final class MailSearchTests: XCTestCase {
         XCTAssertNil(parsed.imapFolder)
     }
 
+    func testFolderKindMatchesWholeWordsOnly() {
+        XCTAssertEqual(MailboxMatcher.kind(ofName: "Robinhood"), .other)
+        XCTAssertEqual(MailboxMatcher.kind(ofName: "Presentations"), .other)
+        XCTAssertEqual(MailboxMatcher.kind(ofName: "Rearchived"), .other)
+        XCTAssertEqual(MailboxMatcher.kind(ofName: "[Gmail]/Sent Mail"), .sent)
+        XCTAssertEqual(MailboxMatcher.kind(ofName: "Sent Items"), .sent)
+        XCTAssertEqual(MailboxMatcher.kind(ofName: "[Gmail]/Bin"), .trash)
+        XCTAssertEqual(MailboxMatcher.kind(ofName: "Deleted Items"), .trash)
+        XCTAssertEqual(MailboxMatcher.kind(ofName: "Junk E-mail"), .spam)
+        XCTAssertEqual(MailboxMatcher.kind(ofName: "INBOX.Archive"), .archive)
+    }
+
     func testCanonicalMailboxAliases() {
         XCTAssertEqual(MailboxRequest.parse("spam, junk, trash"), [.canonical(.spam), .canonical(.spam), .canonical(.trash)])
         XCTAssertEqual(MailboxRequest.parse(nil), [.canonical(.everywhere)])
@@ -222,6 +234,8 @@ final class MailSearchTests: XCTestCase {
         await coordinator.syncNow(account: account, provider: mock, policy: policy, store: store)
         let searchesAfterInitialSync = mock.searchCalls
         let watermarksAfterInitialSync = mock.watermarkCalls
+        XCTAssertEqual(mock.getMessageCalls, 1, "Recent sync mirrors Inbox bodies")
+        XCTAssertEqual(mock.searchCalls, 1, "Recent sync covers the Inbox only")
 
         // 1) Search within 60s cooldown -> 0 server search calls and 0 watermark calls
         let localHits = try await cached.searchFoldered(
@@ -232,13 +246,12 @@ final class MailSearchTests: XCTestCase {
         XCTAssertEqual(mock.searchCalls, searchesAfterInitialSync, "Within cooldown, search must be 100% local")
         XCTAssertEqual(mock.watermarkCalls, watermarksAfterInitialSync, "Within cooldown, no watermark network call")
 
-        // 2) Lazy body loading: first getMessage hits provider, second getMessage is served from SQLite
+        // 2) Bodies mirrored by the sync are served from SQLite
         let firstMsg = try await cached.getMessage(id: localHits[0].id)
         XCTAssertEqual(firstMsg.body, "Full body for Invoice 9001.")
-        XCTAssertEqual(mock.getMessageCalls, 1)
         let secondMsg = try await cached.getMessage(id: localHits[0].id)
         XCTAssertEqual(secondMsg.body, "Full body for Invoice 9001.")
-        XCTAssertEqual(mock.getMessageCalls, 1, "Second getMessage must be served from local SQLite cache")
+        XCTAssertEqual(mock.getMessageCalls, 1, "getMessage must be served from local SQLite cache")
 
         // 3) Expire cooldown, keep watermark unchanged -> 1 watermark check, 0 server search calls
         await coordinator.resetCooldown(accountID: account.id)
@@ -391,7 +404,8 @@ final class MailSearchTests: XCTestCase {
         let mock = MockMailProvider()
         let account = MailAccount(
             provider: .imap,
-            email: "lazy@example.com"
+            email: "lazy@example.com",
+            syncScope: .off
         )
 
         mock.folders = [MailFolderCount(name: "INBOX", messages: 2, unseen: 2, selectable: true)]
@@ -490,7 +504,7 @@ final class MailSearchTests: XCTestCase {
         let store = MailboxCacheStore(directoryURL: tempDir)
         let coordinator = MailboxSyncCoordinator()
         let mock = MockMailProvider()
-        let account = MailAccount(provider: .imap, email: "nocache@example.com")
+        let account = MailAccount(provider: .imap, email: "nocache@example.com", syncScope: .off)
         mock.folders = [MailFolderCount(name: "INBOX", messages: 1, unseen: 0, selectable: true)]
         mock.store(makeSummary("801", account: account, subject: "Quarterly report"), mailbox: "INBOX", body: "Report body")
 
@@ -592,40 +606,98 @@ final class MailSearchTests: XCTestCase {
         store.close()
     }
 
-    func testLazyCacheEvictionKeepsBackgroundSyncedAccounts() throws {
+    func testFreeSpaceRemovesLeastRecentlyUsedFirstAndResetsCoverage() throws {
         let tempDir = FileManager.default.temporaryDirectory
-            .appendingPathComponent("MailMCPEvictionTests-\(UUID().uuidString)", isDirectory: true)
+            .appendingPathComponent("MailMCPFreeSpaceTests-\(UUID().uuidString)", isDirectory: true)
         defer { try? FileManager.default.removeItem(at: tempDir) }
 
         let store = MailboxCacheStore(directoryURL: tempDir)
-        let lazyAccount = MailAccount(provider: .imap, email: "lazy-evict@example.com")
-        let syncedAccount = MailAccount(provider: .imap, email: "synced-keep@example.com", syncScope: .everything)
-        let bigBody = String(repeating: "x", count: 20_000)
+        let account = MailAccount(provider: .imap, email: "free@example.com")
+        let bigBody = String(repeating: "lorem ipsum dolor ", count: 2_000)
 
-        for index in 0..<10 {
-            for account in [lazyAccount, syncedAccount] {
-                let summary = makeSummary("\(index)", account: account, subject: "Message \(index)")
-                store.saveMessage(MailMessage(
-                    id: summary.id, accountID: account.id, accountEmail: account.email, threadID: nil,
-                    from: summary.from, to: summary.to, cc: [], bcc: [], subject: summary.subject,
-                    date: summary.date, body: bigBody, bodyHTML: nil, isUnread: false, labels: [],
-                    attachments: [], mailbox: "INBOX", mailboxKind: "inbox"
-                ))
-            }
+        for index in 0..<40 {
+            let summary = makeSummary("\(index)", account: account, subject: "Message \(index)")
+            store.saveMessage(MailMessage(
+                id: summary.id, accountID: account.id, accountEmail: account.email, threadID: nil,
+                from: summary.from, to: summary.to, cc: [], bcc: [], subject: summary.subject,
+                date: summary.date, body: bigBody, bodyHTML: nil, isUnread: false, labels: [],
+                attachments: [], mailbox: "INBOX", mailboxKind: "inbox"
+            ))
         }
+        // Opening message 0 makes it the most recently used.
+        XCTAssertNotNil(store.getMessage(accountID: account.id, id: "0"))
+        store.updateFolderSyncState(
+            accountID: account.id, folderName: "INBOX", watermark: "w",
+            syncedCount: 40, oldestSyncedAt: Date.distantPast, isFullySynced: true
+        )
         let spec = FolderSearchSpec(query: "Message", mailboxes: ["INBOX"], after: nil, before: nil, limit: 10)
-        store.recordLazyQuery(accountID: lazyAccount.id, request: spec, watermark: nil)
+        store.recordLazyQuery(accountID: account.id, request: spec, watermark: nil)
 
-        let protected: Set<UUID> = [syncedAccount.id]
-        let before = store.lazyCacheSizeBytes(excluding: protected)
-        XCTAssertGreaterThan(before, 200_000)
+        let before = store.usedBytes()
+        XCTAssertGreaterThan(before, 1_000_000)
 
-        let evicted = store.evictLazyCache(capBytes: 100_000, protectedAccountIDs: protected)
-        XCTAssertGreaterThan(evicted, 0)
-        XCTAssertLessThanOrEqual(store.lazyCacheSizeBytes(excluding: protected), 90_000)
-        XCTAssertEqual(store.accountStats(accountID: syncedAccount.id).envelopeCount, 10, "Background-synced mailbox is never trimmed")
-        XCTAssertFalse(store.hasLazyQueryCached(accountID: lazyAccount.id, request: spec), "Trimmed account's query cache is invalidated")
+        let result = store.freeSpace(bytes: 500_000)
+        XCTAssertGreaterThan(result.messagesRemoved, 0)
+        XCTAssertLessThan(result.messagesRemoved, 40, "Frees roughly the requested amount, not everything")
+        XCTAssertGreaterThan(result.bytesFreed, 0)
+        XCTAssertLessThan(store.usedBytes(), before)
+        XCTAssertEqual(result.accountIDs, [account.id])
+        XCTAssertNotNil(store.getMessage(accountID: account.id, id: "0"), "Most recently opened mail goes last")
+        XCTAssertFalse(store.hasLazyQueryCached(accountID: account.id, request: spec), "Query cache is invalidated")
+        XCTAssertFalse(
+            store.cachedFolders(accountID: account.id).contains { $0.isFullySynced },
+            "Sync coverage is reset so reads go to the server"
+        )
         store.close()
+    }
+
+    func testRecentSyncMirrorsInboxBodiesWithoutTrimming() async throws {
+        let tempDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("MailMCPRecentTests-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let store = MailboxCacheStore(directoryURL: tempDir)
+        let coordinator = MailboxSyncCoordinator()
+        let mock = MockMailProvider()
+        let account = MailAccount(provider: .imap, email: "recent@example.com", syncRecentCount: 2)
+        mock.folders = [
+            MailFolderCount(name: "INBOX", messages: 3, unseen: 0, selectable: true),
+            MailFolderCount(name: "Trash", messages: 1, unseen: 0, selectable: true)
+        ]
+        for (id, day) in [("1", "2026-10-01"), ("2", "2026-10-02"), ("3", "2026-10-03")] {
+            var summary = makeSummary(id, account: account, subject: "Inbox \(id)")
+            summary.date = MailSearchQuery.parseDate(day)
+            mock.store(summary, mailbox: "INBOX", body: "Body \(id)")
+        }
+        mock.store(makeSummary("9", account: account, subject: "Trashed"), mailbox: "Trash", body: "Trash body")
+
+        // An older Inbox message cached earlier by a lazy read must survive the sync.
+        var old = makeSummary("0", account: account, subject: "Old lazy read")
+        old.date = MailSearchQuery.parseDate("2025-01-01")
+        old.id = MessageLocator.imap(folder: "INBOX", uid: "0").wire
+        store.saveSummaries([old])
+
+        await coordinator.syncNow(account: account, provider: mock, policy: .default, store: store)
+
+        let stats = store.accountStats(accountID: account.id)
+        XCTAssertEqual(stats.envelopeCount, 4, "3 Inbox headers plus the older lazy copy; Trash is skipped")
+        XCTAssertEqual(stats.bodyCount, 2, "Bodies for the newest 2 Inbox messages")
+        XCTAssertEqual(mock.getMessageCalls, 2)
+        XCTAssertEqual(
+            store.search(accountID: account.id, mailboxes: ["INBOX"], query: "Old lazy", after: nil, before: nil, limit: 5).count,
+            1,
+            "Recent windows never trim older cached mail"
+        )
+        store.close()
+    }
+
+    func testNewAccountsDefaultToRecentThousand() {
+        let account = MailAccount(provider: .gmail, email: "new@example.com")
+        XCTAssertEqual(account.syncScope, .recent)
+        XCTAssertEqual(account.syncRecentCount, 1000)
+        XCTAssertNotEqual(account.syncSchedule, .manual)
+        XCTAssertEqual(CacheSyncPolicy.default.cacheLimitMB, 10_000)
+        XCTAssertEqual(AccountSyncScope.off.title, "Off (lazy sync only)")
     }
 
     func testLegacyCacheOverrideMigratesToSyncScope() throws {
@@ -639,13 +711,31 @@ final class MailSearchTests: XCTestCase {
             let data = try JSONSerialization.data(withJSONObject: json)
             return try JSONDecoder().decode(MailAccount.self, from: data)
         }
-        XCTAssertEqual(try decode(nil).syncScope, .off)
-        XCTAssertEqual(try decode("useDefault").syncScope, .off)
-        XCTAssertEqual(try decode("lazy").syncScope, .off)
+        // Mailboxes that were Off before policy v2 move to the Recent 1,000 default.
+        XCTAssertEqual(try decode(nil).syncScope, .recent)
+        XCTAssertEqual(try decode(nil).syncRecentCount, 1000)
+        XCTAssertEqual(try decode(nil).syncSchedule, MailAccount.defaultSyncSchedule)
+        XCTAssertEqual(try decode("useDefault").syncScope, .recent)
+        XCTAssertEqual(try decode("lazy").syncScope, .recent)
         XCTAssertEqual(try decode("rollingWindow").syncScope, .recent)
         XCTAssertEqual(try decode("timeWindow").syncScope, .days)
         XCTAssertEqual(try decode("fullSync").syncScope, .everything)
         XCTAssertEqual(try decode("fullSync").syncSchedule, .manual)
+    }
+
+    func testExplicitOffChoiceSurvivesPolicyMigration() throws {
+        var account = MailAccount(provider: .imap, email: "off@example.com")
+        account.syncScope = .off
+        let data = try JSONEncoder().encode(account)
+        let decoded = try JSONDecoder().decode(MailAccount.self, from: data)
+        XCTAssertEqual(decoded.syncScope, .off)
+
+        var legacy = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        legacy.removeValue(forKey: "syncPolicyVersion")
+        legacy["syncRecentCount"] = 500
+        let migrated = try JSONDecoder().decode(MailAccount.self, from: JSONSerialization.data(withJSONObject: legacy))
+        XCTAssertEqual(migrated.syncScope, .recent)
+        XCTAssertEqual(migrated.syncRecentCount, 1000)
     }
 }
 

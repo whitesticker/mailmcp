@@ -46,6 +46,12 @@ struct MailboxCacheStats: Sendable {
     var lastSyncAt: Date?
 }
 
+struct CacheFreeSpaceResult: Sendable {
+    var messagesRemoved: Int = 0
+    var bytesFreed: Int64 = 0
+    var accountIDs: Set<UUID> = []
+}
+
 final class MailboxCacheStore: @unchecked Sendable {
     static let shared = MailboxCacheStore(directoryURL: Paths.mailboxCacheDirectory)
 
@@ -341,15 +347,36 @@ final class MailboxCacheStore: @unchecked Sendable {
         notifyChange()
     }
 
-    func missingBodyMessageIDs(accountID: UUID, limit: Int) -> [String] {
+    /// Newest messages without a cached body. With `mailbox`, only the newest `window` messages of that
+    /// folder (on or after `since`) are considered, so recent/days policies never backfill older mail.
+    func missingBodyMessageIDs(
+        accountID: UUID,
+        limit: Int,
+        mailbox: String? = nil,
+        since: Date? = nil,
+        window: Int? = nil
+    ) -> [String] {
         lock.lock()
         defer { lock.unlock() }
         guard let db else { return [] }
 
+        var clauses = ["account_id = ?1"]
+        if mailbox != nil {
+            clauses.append("(LOWER(mailbox) = LOWER(?3) OR LOWER(mailbox_kind) = LOWER(?4))")
+        }
+        if since != nil {
+            clauses.append("date_ts >= ?5")
+        }
+        let windowClause = window.map { "LIMIT \(max($0, 1))" } ?? ""
         let sql = """
-        SELECT message_id
-        FROM messages
-        WHERE account_id = ?1 AND has_body = 0
+        SELECT message_id FROM (
+            SELECT message_id, has_body, date_ts
+            FROM messages
+            WHERE \(clauses.joined(separator: " AND "))
+            ORDER BY COALESCE(date_ts, 0) DESC
+            \(windowClause)
+        )
+        WHERE has_body = 0
         ORDER BY COALESCE(date_ts, 0) DESC
         LIMIT ?2;
         """
@@ -358,6 +385,13 @@ final class MailboxCacheStore: @unchecked Sendable {
         defer { sqlite3_finalize(stmt) }
         bindText(stmt, index: 1, accountID.uuidString)
         sqlite3_bind_int(stmt, 2, Int32(max(limit, 1)))
+        if let mailbox {
+            bindText(stmt, index: 3, mailbox)
+            bindText(stmt, index: 4, MailboxMatcher.kind(ofName: mailbox).rawValue)
+        }
+        if let since {
+            sqlite3_bind_double(stmt, 5, since.timeIntervalSince1970)
+        }
 
         var ids: [String] = []
         while sqlite3_step(stmt) == SQLITE_ROW {
@@ -861,75 +895,52 @@ final class MailboxCacheStore: @unchecked Sendable {
         exec("COMMIT;", on: db)
     }
 
-    func pruneRollingWindow(accountID: UUID, mailbox: String, keepLatest: Int) {
-        guard keepLatest > 0 else { return }
-        lock.lock()
-        defer { lock.unlock() }
-        guard let db else { return }
+    // MARK: - Global Size Limit
 
-        let sql = """
-        DELETE FROM messages
-        WHERE account_id = ?1 AND LOWER(mailbox) = LOWER(?2)
-          AND rowid NOT IN (
-              SELECT rowid FROM messages
-              WHERE account_id = ?1 AND LOWER(mailbox) = LOWER(?2)
-              ORDER BY COALESCE(date_ts, 0) DESC
-              LIMIT ?3
-          );
-        """
-        var stmt: OpaquePointer?
-        if sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK, let stmt {
-            bindText(stmt, index: 1, accountID.uuidString)
-            bindText(stmt, index: 2, mailbox)
-            sqlite3_bind_int(stmt, 3, Int32(keepLatest))
-            _ = sqlite3_step(stmt)
-            sqlite3_finalize(stmt)
-        }
-    }
-
-    // MARK: - Lazy Cache Size Cap
-
-    /// Approximate bytes held for accounts that are not background-synced.
-    func lazyCacheSizeBytes(excluding protectedAccountIDs: Set<UUID>) -> Int64 {
+    /// Bytes held in live database pages (messages, bodies and the search index). Unlike the file size,
+    /// this drops as soon as rows are deleted.
+    func usedBytes() -> Int64 {
         lock.lock()
         defer { lock.unlock() }
         guard let db else { return 0 }
-        return lazyCacheSizeLocked(excluding: protectedAccountIDs, on: db)
+        return usedBytesLocked(on: db)
     }
 
-    /// Evicts least-recently-used lazy data until it fits under 90% of `capBytes`.
+    private func usedBytesLocked(on db: OpaquePointer) -> Int64 {
+        let pageSize = Int64(scalarInt("PRAGMA page_size;", on: db))
+        let pages = Int64(scalarInt("PRAGMA page_count;", on: db))
+        let free = Int64(scalarInt("PRAGMA freelist_count;", on: db))
+        return max(pages - free, 0) * pageSize
+    }
+
+    /// Deletes least-recently-used messages (last opened, else last synced) until roughly `bytes` are freed.
+    /// Only ever called on the user's request. Affected accounts lose their sync coverage so reads go to the
+    /// server until the next sync.
     @discardableResult
-    func evictLazyCache(capBytes: Int64, protectedAccountIDs: Set<UUID>) -> Int {
+    func freeSpace(bytes target: Int64) -> CacheFreeSpaceResult {
         lock.lock()
-        guard let db else {
+        guard let db, target > 0 else {
             lock.unlock()
-            return 0
+            return CacheFreeSpaceResult()
         }
-        var remaining = lazyCacheSizeLocked(excluding: protectedAccountIDs, on: db)
-        guard remaining > capBytes else {
-            lock.unlock()
-            return 0
-        }
-        let target = capBytes * 9 / 10
-        let exclusion = Self.accountExclusionClause(protectedAccountIDs, column: "m.account_id")
-        var evicted = 0
+        let startBytes = usedBytesLocked(on: db)
+        var estimated: Int64 = 0
+        var result = CacheFreeSpaceResult()
         var affectedAccounts = Set<String>()
-        var diskPaths: [String] = []
 
         exec("BEGIN IMMEDIATE TRANSACTION;", on: db)
-        while remaining > target {
+        while estimated < target {
             let sql = """
             SELECT m.rowid, m.account_id, m.message_id,
-                   LENGTH(m.subject) + LENGTH(m.snippet) + LENGTH(m.to_json) + 256
-                   + COALESCE((SELECT LENGTH(b.body_text) + COALESCE(LENGTH(b.body_html), 0)
+                   LENGTH(m.subject) * 2 + LENGTH(m.snippet) * 2 + LENGTH(m.to_json) + LENGTH(m.from_addr) * 2
+                   + LENGTH(m.cc_json) + LENGTH(m.labels_json) + 300
+                   + COALESCE((SELECT LENGTH(b.body_text) * 2 + COALESCE(LENGTH(b.body_html), 0)
+                                      + LENGTH(b.attachments_json)
                                FROM message_bodies b
                                WHERE b.account_id = m.account_id AND b.message_id = m.message_id), 0)
-                   + COALESCE((SELECT SUM(COALESCE(a.size, 0)) FROM attachments a
-                               WHERE a.account_id = m.account_id AND a.message_id = m.message_id), 0)
             FROM messages m
-            WHERE 1 = 1 \(exclusion)
-            ORDER BY COALESCE(m.last_accessed_at, m.updated_at) ASC
-            LIMIT 200;
+            ORDER BY COALESCE(m.last_accessed_at, m.updated_at) ASC, COALESCE(m.date_ts, 0) ASC
+            LIMIT 500;
             """
             var stmt: OpaquePointer?
             guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK, let stmt else { break }
@@ -946,76 +957,43 @@ final class MailboxCacheStore: @unchecked Sendable {
             if batch.isEmpty { break }
 
             for item in batch {
-                if remaining <= target { break }
-                diskPaths += attachmentPathsLocked(accountID: item.accountID, messageID: item.messageID, on: db)
+                if estimated >= target { break }
                 exec("DELETE FROM messages_fts WHERE rowid = \(item.rowid);", on: db)
-                for table in ["message_bodies", "attachments"] {
-                    deleteRowLocked(table: table, accountID: item.accountID, messageID: item.messageID, on: db)
-                }
+                deleteRowLocked(table: "message_bodies", accountID: item.accountID, messageID: item.messageID, on: db)
                 exec("DELETE FROM messages WHERE rowid = \(item.rowid);", on: db)
-                remaining -= item.bytes
-                evicted += 1
+                estimated += item.bytes
+                result.messagesRemoved += 1
                 affectedAccounts.insert(item.accountID)
             }
         }
         for accountID in affectedAccounts {
-            exec("DELETE FROM cached_queries WHERE account_id = '\(accountID)';", on: db)
-        }
-        exec("COMMIT;", on: db)
-        lock.unlock()
-
-        for path in diskPaths {
-            try? FileManager.default.removeItem(atPath: path)
-        }
-        if evicted > 0 {
-            notifyChange()
-        }
-        return evicted
-    }
-
-    private func lazyCacheSizeLocked(excluding protectedAccountIDs: Set<UUID>, on db: OpaquePointer) -> Int64 {
-        let messageExclusion = Self.accountExclusionClause(protectedAccountIDs, column: "account_id")
-        let queries = [
-            "SELECT COALESCE(SUM(LENGTH(subject) + LENGTH(snippet) + LENGTH(to_json) + 256), 0) FROM messages WHERE 1 = 1 \(messageExclusion);",
-            "SELECT COALESCE(SUM(LENGTH(body_text) + COALESCE(LENGTH(body_html), 0)), 0) FROM message_bodies WHERE 1 = 1 \(messageExclusion);",
-            "SELECT COALESCE(SUM(COALESCE(size, 0)), 0) FROM attachments WHERE 1 = 1 \(messageExclusion);"
-        ]
-        var total: Int64 = 0
-        for sql in queries {
-            var stmt: OpaquePointer?
-            if sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK, let stmt {
-                if sqlite3_step(stmt) == SQLITE_ROW {
-                    total += sqlite3_column_int64(stmt, 0)
+            for sql in [
+                "DELETE FROM cached_queries WHERE account_id = ?1;",
+                "UPDATE folders SET watermark = NULL, synced_count = 0, oldest_synced_at = NULL, is_fully_synced = 0 WHERE account_id = ?1;",
+                "UPDATE account_sync_state SET watermark = NULL WHERE account_id = ?1;"
+            ] {
+                var stmt: OpaquePointer?
+                if sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK, let stmt {
+                    bindText(stmt, index: 1, accountID)
+                    _ = sqlite3_step(stmt)
+                    sqlite3_finalize(stmt)
                 }
-                sqlite3_finalize(stmt)
             }
         }
-        return total
-    }
-
-    private static func accountExclusionClause(_ ids: Set<UUID>, column: String) -> String {
-        guard !ids.isEmpty else { return "" }
-        let list = ids.map { "'\($0.uuidString)'" }.joined(separator: ",")
-        return "AND \(column) NOT IN (\(list))"
-    }
-
-    private func attachmentPathsLocked(accountID: String, messageID: String, on db: OpaquePointer) -> [String] {
-        var stmt: OpaquePointer?
-        guard sqlite3_prepare_v2(
-            db,
-            "SELECT disk_path FROM attachments WHERE account_id = ?1 AND message_id = ?2;",
-            -1,
-            &stmt,
-            nil
-        ) == SQLITE_OK, let stmt else { return [] }
-        defer { sqlite3_finalize(stmt) }
-        bindText(stmt, index: 1, accountID)
-        bindText(stmt, index: 2, messageID)
-        var paths: [String] = []
-        while sqlite3_step(stmt) == SQLITE_ROW {
-            if let path = columnText(stmt, 0) { paths.append(path) }
+        exec("COMMIT;", on: db)
+        if result.messagesRemoved > 0 {
+            // FTS5 keeps delete markers until segments merge; optimize reclaims their pages now.
+            exec("INSERT INTO messages_fts(messages_fts) VALUES('optimize');", on: db)
+            exec("PRAGMA wal_checkpoint(TRUNCATE);", on: db)
         }
-        return paths
+        result.bytesFreed = max(startBytes - usedBytesLocked(on: db), 0)
+        result.accountIDs = Set(affectedAccounts.compactMap(UUID.init(uuidString:)))
+        lock.unlock()
+
+        if result.messagesRemoved > 0 {
+            notifyChange()
+        }
+        return result
     }
 
     private func deleteRowLocked(table: String, accountID: String, messageID: String, on db: OpaquePointer) {
@@ -1047,82 +1025,6 @@ final class MailboxCacheStore: @unchecked Sendable {
         sqlite3_bind_double(stmt, 3, Date().timeIntervalSince1970)
         _ = sqlite3_step(stmt)
         sqlite3_finalize(stmt)
-    }
-
-    // MARK: - Attachments on Disk
-
-    func cachedAttachment(accountID: UUID, messageID: String, attachmentID: String) -> MailAttachmentData? {
-        lock.lock()
-        defer { lock.unlock() }
-        guard let db else { return nil }
-
-        let sql = """
-        SELECT filename, mime_type, size, disk_path
-        FROM attachments
-        WHERE account_id = ?1 AND message_id = ?2 AND attachment_id = ?3
-        LIMIT 1;
-        """
-        var stmt: OpaquePointer?
-        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK, let stmt else { return nil }
-        defer { sqlite3_finalize(stmt) }
-        bindText(stmt, index: 1, accountID.uuidString)
-        bindText(stmt, index: 2, messageID)
-        bindText(stmt, index: 3, attachmentID)
-
-        guard sqlite3_step(stmt) == SQLITE_ROW else { return nil }
-        let filename = columnText(stmt, 0) ?? "attachment"
-        let mimeType = columnText(stmt, 1) ?? "application/octet-stream"
-        let size = columnOptionalInt(stmt, 2)
-        guard let diskPath = columnText(stmt, 3),
-              let data = try? Data(contentsOf: URL(fileURLWithPath: diskPath)) else {
-            return nil
-        }
-        return MailAttachmentData(
-            meta: MailAttachmentMeta(id: attachmentID, filename: filename, mimeType: mimeType, size: size ?? data.count),
-            dataBase64: data.base64EncodedString()
-        )
-    }
-
-    func saveAttachment(_ attachment: MailAttachmentData, accountID: UUID, messageID: String) {
-        guard let rawData = Data(base64Encoded: attachment.dataBase64) else { return }
-        lock.lock()
-        defer { lock.unlock() }
-        guard let db else { return }
-
-        let accountDir = attachmentsDirectoryURL.appendingPathComponent(accountID.uuidString, isDirectory: true)
-        try? FileManager.default.createDirectory(at: accountDir, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
-        let fileKey = FileHash.sha256Hex(Data("\(messageID)|\(attachment.meta.id)".utf8))
-        let fileURL = accountDir.appendingPathComponent(fileKey)
-        do {
-            try rawData.write(to: fileURL, options: .atomic)
-            chmod(fileURL.path, 0o600)
-        } catch {
-            return
-        }
-
-        let sql = """
-        INSERT INTO attachments (account_id, message_id, attachment_id, filename, mime_type, size, disk_path, updated_at)
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-        ON CONFLICT(account_id, message_id, attachment_id) DO UPDATE SET
-            filename = excluded.filename,
-            mime_type = excluded.mime_type,
-            size = excluded.size,
-            disk_path = excluded.disk_path,
-            updated_at = excluded.updated_at;
-        """
-        var stmt: OpaquePointer?
-        if sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK, let stmt {
-            bindText(stmt, index: 1, accountID.uuidString)
-            bindText(stmt, index: 2, messageID)
-            bindText(stmt, index: 3, attachment.meta.id)
-            bindText(stmt, index: 4, attachment.meta.filename)
-            bindText(stmt, index: 5, attachment.meta.mimeType)
-            bindOptionalInt(stmt, index: 6, attachment.meta.size ?? rawData.count)
-            bindText(stmt, index: 7, fileURL.path)
-            sqlite3_bind_double(stmt, 8, Date().timeIntervalSince1970)
-            _ = sqlite3_step(stmt)
-            sqlite3_finalize(stmt)
-        }
     }
 
     // MARK: - Contacts & Threads from Cache
@@ -1275,7 +1177,6 @@ final class MailboxCacheStore: @unchecked Sendable {
             exec("COMMIT;", on: db)
             exec("VACUUM;", on: db)
             try? FileManager.default.removeItem(at: attachmentsDirectoryURL)
-            try? FileManager.default.createDirectory(at: attachmentsDirectoryURL, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
         }
         lock.unlock()
         notifyChange()
@@ -1289,11 +1190,6 @@ final class MailboxCacheStore: @unchecked Sendable {
 
         try? FileManager.default.createDirectory(
             at: directoryURL,
-            withIntermediateDirectories: true,
-            attributes: [.posixPermissions: 0o700]
-        )
-        try? FileManager.default.createDirectory(
-            at: attachmentsDirectoryURL,
             withIntermediateDirectories: true,
             attributes: [.posixPermissions: 0o700]
         )
@@ -1427,6 +1323,48 @@ final class MailboxCacheStore: @unchecked Sendable {
             COMMIT;
             """, on: handle)
         }
+        if scalarInt("PRAGMA user_version;", on: handle) < 2 {
+            reclassifyMailboxKindsLocked(on: handle)
+            exec("PRAGMA user_version = 2;", on: handle)
+        }
+        if scalarInt("PRAGMA user_version;", on: handle) < 3 {
+            // Attachments are no longer cached (docs/sync-retention.md, v2).
+            exec("DELETE FROM attachments;", on: handle)
+            try? FileManager.default.removeItem(at: attachmentsDirectoryURL)
+            exec("PRAGMA user_version = 3;", on: handle)
+        }
+    }
+
+    /// Recomputes stored folder kinds after `MailboxMatcher.kind` stopped matching substrings (e.g. "Robinhood" as trash).
+    private func reclassifyMailboxKindsLocked(on db: OpaquePointer) {
+        var pairs: [(table: String, name: String, kind: String)] = []
+        for (table, column) in [("messages", "mailbox"), ("folders", "name")] {
+            var stmt: OpaquePointer?
+            guard sqlite3_prepare_v2(db, "SELECT DISTINCT \(column), \(table == "messages" ? "mailbox_kind" : "kind") FROM \(table) WHERE \(column) IS NOT NULL;", -1, &stmt, nil) == SQLITE_OK,
+                  let stmt else { continue }
+            while sqlite3_step(stmt) == SQLITE_ROW {
+                guard let name = columnText(stmt, 0) else { continue }
+                let stored = columnText(stmt, 1) ?? ""
+                let kind = MailboxMatcher.kind(ofName: name).rawValue
+                if kind != stored { pairs.append((table, name, kind)) }
+            }
+            sqlite3_finalize(stmt)
+        }
+        guard !pairs.isEmpty else { return }
+        exec("BEGIN IMMEDIATE TRANSACTION;", on: db)
+        for pair in pairs {
+            let sql = pair.table == "messages"
+                ? "UPDATE messages SET mailbox_kind = ?1 WHERE mailbox = ?2;"
+                : "UPDATE folders SET kind = ?1 WHERE name = ?2;"
+            var stmt: OpaquePointer?
+            if sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK, let stmt {
+                bindText(stmt, index: 1, pair.kind)
+                bindText(stmt, index: 2, pair.name)
+                _ = sqlite3_step(stmt)
+                sqlite3_finalize(stmt)
+            }
+        }
+        exec("COMMIT;", on: db)
     }
 
     private func upsertSummaryLocked(
