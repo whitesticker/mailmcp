@@ -294,6 +294,8 @@ struct MailAccount: Codable, Identifiable, Hashable, Sendable {
     var syncDaysBack: Int
     var syncSchedule: AccountSyncSchedule
     var fullSyncBodies: Bool
+    /// Lowercased sender addresses whose remote images load without asking.
+    var trustedImageSenders: [String]
 
     init(
         id: UUID = UUID(),
@@ -308,7 +310,8 @@ struct MailAccount: Codable, Identifiable, Hashable, Sendable {
         syncRecentCount: Int = 500,
         syncDaysBack: Int = 90,
         syncSchedule: AccountSyncSchedule = .manual,
-        fullSyncBodies: Bool = true
+        fullSyncBodies: Bool = true,
+        trustedImageSenders: [String] = []
     ) {
         self.id = id
         self.provider = provider
@@ -323,6 +326,7 @@ struct MailAccount: Codable, Identifiable, Hashable, Sendable {
         self.syncDaysBack = syncDaysBack
         self.syncSchedule = syncSchedule
         self.fullSyncBodies = fullSyncBodies
+        self.trustedImageSenders = trustedImageSenders
     }
 
     private enum LegacyCodingKeys: String, CodingKey {
@@ -354,6 +358,7 @@ struct MailAccount: Codable, Identifiable, Hashable, Sendable {
         syncDaysBack = try container.decodeIfPresent(Int.self, forKey: .syncDaysBack) ?? 90
         syncSchedule = try container.decodeIfPresent(AccountSyncSchedule.self, forKey: .syncSchedule) ?? .manual
         fullSyncBodies = try container.decodeIfPresent(Bool.self, forKey: .fullSyncBodies) ?? true
+        trustedImageSenders = try container.decodeIfPresent([String].self, forKey: .trustedImageSenders) ?? []
     }
 }
 

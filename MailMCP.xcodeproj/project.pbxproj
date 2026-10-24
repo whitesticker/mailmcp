@@ -42,6 +42,9 @@
 		46DAE21DB7580937F18F12EE /* VaultCrypto.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4F7B30E33903F109791E4C40 /* VaultCrypto.swift */; };
 		4755F815AFBEEE7580D460BF /* OAuthClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = D4F496757F45C4DEC6799052 /* OAuthClient.swift */; };
 		485C5A77D45AAC57F9B76270 /* FlowLayout.swift in Sources */ = {isa = PBXBuildFile; fileRef = 561948842F91DFE2327CE678 /* FlowLayout.swift */; };
+		D7E1A0010000000000000006 /* ColumnResizeHandle.swift in Sources */ = {isa = PBXBuildFile; fileRef = D7E1A0010000000000000005 /* ColumnResizeHandle.swift */; };
+		D7E1A0010000000000000004 /* MailboxReaderView.swift in Sources */ = {isa = PBXBuildFile; fileRef = D7E1A0010000000000000003 /* MailboxReaderView.swift */; };
+		D7E1A0010000000000000002 /* MailHTMLView.swift in Sources */ = {isa = PBXBuildFile; fileRef = D7E1A0010000000000000001 /* MailHTMLView.swift */; };
 		4AA10F51FDEC161F76962418 /* VaultStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = F4A1ACCCFF88F025F29274F1 /* VaultStore.swift */; };
 		4C73DA19DF96BDC765C6BEAC /* mailmcp-mcp in Resources */ = {isa = PBXBuildFile; fileRef = 2B7702C6200708276D2901FF /* mailmcp-mcp */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
 		4FFA866E988C734A5D65EF23 /* MCPStdioServer.swift in Sources */ = {isa = PBXBuildFile; fileRef = C1F5ED52C7CFBFDA0102B974 /* MCPStdioServer.swift */; };
@@ -135,6 +138,9 @@
 		53060A0311A1A60896048E08 /* MCPToolCatalog.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MCPToolCatalog.swift; sourceTree = "<group>"; };
 		5313760CCD7BD7FDA09D59B6 /* MailSearchTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MailSearchTests.swift; sourceTree = "<group>"; };
 		561948842F91DFE2327CE678 /* FlowLayout.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FlowLayout.swift; sourceTree = "<group>"; };
+		D7E1A0010000000000000005 /* ColumnResizeHandle.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ColumnResizeHandle.swift; sourceTree = "<group>"; };
+		D7E1A0010000000000000003 /* MailboxReaderView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MailboxReaderView.swift; sourceTree = "<group>"; };
+		D7E1A0010000000000000001 /* MailHTMLView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MailHTMLView.swift; sourceTree = "<group>"; };
 		59D78519F4A93A74EBF4BCFB /* Models.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Models.swift; sourceTree = "<group>"; };
 		5E49BF94D5977E87B0CAC8A6 /* MCPCallLog.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MCPCallLog.swift; sourceTree = "<group>"; };
 		6192651BB9621E1CFAF96C00 /* RFC822.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RFC822.swift; sourceTree = "<group>"; };
@@ -264,6 +270,9 @@
 				6E28C8949C7E4D61B55C491E /* AddVaultView.swift */,
 				7A6B7D6EFD88A2BBA396AF82 /* ContentView.swift */,
 				561948842F91DFE2327CE678 /* FlowLayout.swift */,
+				D7E1A0010000000000000005 /* ColumnResizeHandle.swift */,
+				D7E1A0010000000000000003 /* MailboxReaderView.swift */,
+				D7E1A0010000000000000001 /* MailHTMLView.swift */,
 				8614D4C61F1A7C36721078A5 /* MenuBarView.swift */,
 				F04A3CFE7CDEF1274917E90C /* MergeVaultView.swift */,
 				12D0548DB037A1D52C23CE8D /* OnboardingView.swift */,
@@ -586,6 +595,9 @@
 				54B368C5286EC54F3E601C37 /* CursorInstaller.swift in Sources */,
 				51A3304940CD89D654E1E8C5 /* DeviceConfig.swift in Sources */,
 				485C5A77D45AAC57F9B76270 /* FlowLayout.swift in Sources */,
+				D7E1A0010000000000000006 /* ColumnResizeHandle.swift in Sources */,
+				D7E1A0010000000000000004 /* MailboxReaderView.swift in Sources */,
+				D7E1A0010000000000000002 /* MailHTMLView.swift in Sources */,
 				F7643DB0C0F55BF3879051EA /* GmailProvider.swift in Sources */,
 				9DA0E44E02E437D6BBE0F448 /* GraphProvider.swift in Sources */,
 				06C981A99DE06E2AB9E4F180 /* IMAPAccountImporter.swift in Sources */,
