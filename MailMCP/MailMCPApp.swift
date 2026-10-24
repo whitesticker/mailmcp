@@ -94,8 +94,8 @@ final class MailMCPAppDelegate: NSObject, NSApplicationDelegate {
 @MainActor
 enum WindowMorphController {
     static let lockedSize = NSSize(width: 360, height: 420)
-    static let unlockedSize = NSSize(width: 940, height: 620)
-    static let unlockedMinSize = NSSize(width: 860, height: 560)
+    static let unlockedSize = NSSize(width: 1240, height: 720)
+    static let unlockedMinSize = NSSize(width: 1100, height: 560)
 
     static func applyInitialSize(isUnlocked: Bool) {
         guard let window = MailMCPAppDelegate.mainWindow() else { return }
@@ -123,7 +123,11 @@ enum WindowMorphController {
             window.contentMaxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
         }
 
-        let targetFrameRect = window.frameRect(forContentRect: NSRect(origin: .zero, size: targetContentSize))
+        var targetFrameRect = window.frameRect(forContentRect: NSRect(origin: .zero, size: targetContentSize))
+        if toUnlocked, let visible = (window.screen ?? NSScreen.main)?.visibleFrame {
+            targetFrameRect.size.width = min(targetFrameRect.width, visible.width - 24)
+            targetFrameRect.size.height = min(targetFrameRect.height, visible.height - 24)
+        }
         let currentFrame = window.frame
         var newOrigin = NSPoint(
             x: round(currentFrame.midX - targetFrameRect.width / 2),
@@ -188,7 +192,7 @@ struct RootView: View {
         ZStack {
             if showWorkspace {
                 ContentView()
-                    .frame(minWidth: 860, idealWidth: 940, maxWidth: .infinity, minHeight: 560, idealHeight: 620, maxHeight: .infinity)
+                    .frame(minWidth: 1100, idealWidth: 1240, maxWidth: .infinity, minHeight: 560, idealHeight: 720, maxHeight: .infinity)
                     .transition(.opacity.combined(with: .scale(scale: 0.98)))
             } else {
                 OnboardingView()

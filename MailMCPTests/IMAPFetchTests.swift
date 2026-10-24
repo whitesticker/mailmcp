@@ -43,6 +43,67 @@ final class IMAPFetchTests: XCTestCase {
         XCTAssertEqual(parsed.first?.text, "hello body")
     }
 
+    func testMIMEDecodesQuotedPrintableHTML() {
+        let raw = """
+        From: Aeroplan <communications@mail.aircanada.com>\r
+        Subject: Reminder\r
+        MIME-Version: 1.0\r
+        Content-Type: multipart/alternative; boundary="b1"\r
+        \r
+        --b1\r
+        Content-Type: text/plain; charset=UTF-8\r
+        Content-Transfer-Encoding: quoted-printable\r
+        \r
+        Don=E2=80=99t miss out, offer ends Oct. 31. This line is long enough to be=\r
+         soft wrapped.\r
+        --b1\r
+        Content-Type: text/html; charset=UTF-8\r
+        Content-Transfer-Encoding: quoted-printable\r
+        \r
+        <table border=3D"0" cellpadding=3D"0"><tr><td>Don=E2=80=99t miss out</td></tr></table>\r
+        --b1--\r
+        """
+        let parsed = MIMEParser.parse(raw: Data(raw.utf8))
+        XCTAssertEqual(parsed.html?.trimmingCharacters(in: .whitespacesAndNewlines), "<table border=\"0\" cellpadding=\"0\"><tr><td>Don\u{2019}t miss out</td></tr></table>")
+        XCTAssertEqual(parsed.text, "Don\u{2019}t miss out, offer ends Oct. 31. This line is long enough to be soft wrapped.")
+        XCTAssertTrue(parsed.attachments.isEmpty)
+    }
+
+    func testMIMEWalksNestedMultipartWithBase64CharsetAndAttachment() {
+        let html = Data("<p>Caf\u{E9} cr\u{E8}me</p>".data(using: .isoLatin1)!).base64EncodedString()
+        let raw = """
+        Content-Type: multipart/mixed; boundary=outer\r
+        \r
+        --outer\r
+        Content-Type: multipart/alternative; boundary=inner\r
+        \r
+        --inner\r
+        Content-Type: text/plain; charset=utf-8\r
+        \r
+        plain body\r
+        --inner\r
+        Content-Type: text/html; charset=ISO-8859-1\r
+        Content-Transfer-Encoding: base64\r
+        \r
+        \(html)\r
+        --inner--\r
+        --outer\r
+        Content-Type: application/pdf; name="=?UTF-8?B?UmXMgXN1bcOpLnBkZg==?="\r
+        Content-Disposition: attachment; filename="=?UTF-8?Q?R=C3=A9sum=C3=A9.pdf?="\r
+        Content-Transfer-Encoding: base64\r
+        \r
+        JVBERi0xLjQK\r
+        --outer--\r
+        """
+        let parsed = MIMEParser.parse(raw: Data(raw.utf8))
+        XCTAssertEqual(parsed.text, "plain body")
+        XCTAssertEqual(parsed.html?.trimmingCharacters(in: .whitespacesAndNewlines), "<p>Caf\u{E9} cr\u{E8}me</p>")
+        XCTAssertEqual(parsed.attachments.count, 1)
+        XCTAssertEqual(parsed.attachments.first?.id, "imap:2")
+        XCTAssertEqual(parsed.attachments.first?.filename, "R\u{E9}sum\u{E9}.pdf")
+        XCTAssertEqual(parsed.attachments.first?.mimeType, "application/pdf")
+    }
+
     func testMIMEFallbackWithoutContentTypeHeader() {
         let raw = "--bound\r\nContent-Type: text/plain\r\n\r\nrecovered\r\n--bound--\r\n"
         let parsed = MIMEParser.plainText(from: [:], body: raw)

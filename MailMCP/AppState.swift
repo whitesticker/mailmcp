@@ -58,6 +58,8 @@ final class AppState: ObservableObject {
     @Published var accountSyncProgress: [UUID: String] = [:]
     @Published var cacheRevision: Int = 0
     @Published var autoSyncPausedReason: String?
+    @Published private var liveFolders: [UUID: [MailFolderCount]] = [:]
+    private var folderRefreshDates: [UUID: Date] = [:]
 
     var mcpAgentCount: Int { mcpAgents.count }
 
@@ -845,6 +847,35 @@ final class AppState: ObservableObject {
     func cacheStats(for account: MailAccount) -> AccountCacheStats {
         _ = cacheRevision
         return MailboxCacheStore.shared.accountStats(accountID: account.id)
+    }
+
+    func mailFolders(for account: MailAccount) -> [MailFolderCount] {
+        if let live = liveFolders[account.id] { return live }
+        return MailboxCacheStore.shared.cachedFolders(accountID: account.id).map {
+            MailFolderCount(name: $0.name, messages: $0.messages, unseen: $0.unseen, selectable: $0.selectable, remoteID: $0.remoteID)
+        }
+    }
+
+    func refreshFolders(for account: MailAccount, force: Bool = false) {
+        if !force, let last = folderRefreshDates[account.id], Date().timeIntervalSince(last) < 120 { return }
+        folderRefreshDates[account.id] = Date()
+        guard let mail = try? provider(for: account) else { return }
+        Task { [weak self] in
+            guard let folders = try? await mail.listFolders(includeCounts: true), !folders.isEmpty else {
+                self?.folderRefreshDates[account.id] = nil
+                return
+            }
+            self?.liveFolders[account.id] = folders
+        }
+    }
+
+    func adjustUnseen(accountID: UUID, folder: String, delta: Int) {
+        MailboxCacheStore.shared.adjustFolderUnseen(accountID: accountID, folder: folder, delta: delta)
+        guard var folders = liveFolders[accountID],
+              let index = folders.firstIndex(where: { $0.name == folder }),
+              let unseen = folders[index].unseen else { return }
+        folders[index].unseen = max(unseen + delta, 0)
+        liveFolders[accountID] = folders
     }
 
     func syncMailboxCacheNow(account: MailAccount) async {

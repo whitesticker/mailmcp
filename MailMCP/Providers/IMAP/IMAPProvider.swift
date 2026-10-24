@@ -505,8 +505,7 @@ struct IMAPProvider: MailProviding {
         var html: String?
         var attachments: [MailAttachmentMeta] = []
         if let raw = try? await server.fetchRawMessage(identifier: uid) {
-            let parsed = RFC822.splitMessage(String(decoding: raw, as: UTF8.self))
-            let bodies = MIMEParser.plainText(from: parsed.headers, body: parsed.body)
+            let bodies = MIMEParser.parse(raw: raw)
             text = bodies.text
             html = bodies.html
             attachments = bodies.attachments

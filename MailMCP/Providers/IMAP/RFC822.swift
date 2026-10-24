@@ -94,22 +94,228 @@ enum RFC822 {
     }
 }
 
+/// Parses MIME bodies on a Latin-1 "wire" string (one character per byte) so transfer encodings and charsets decode losslessly.
 enum MIMEParser {
-    static func plainText(from headers: [String: String], body: String) -> (text: String, html: String?, attachments: [MailAttachmentMeta]) {
-        var headers = headers
-        let contentType = headers["content-type"]?.lowercased() ?? ""
-        if contentType.contains("multipart/") {
-            return parseMultipart(headers: headers, body: body)
+    typealias Parsed = (text: String, html: String?, attachments: [MailAttachmentMeta])
+
+    private struct Collector {
+        var text = ""
+        var html: String?
+        var attachments: [MailAttachmentMeta] = []
+    }
+
+    static func parse(raw: Data) -> Parsed {
+        let wire = normalizeLineEndings(wireString(raw))
+        let split = splitHeadersAndBody(wire, trimLeading: false)
+        return parse(headers: split.headers, wireBody: split.body)
+    }
+
+    static func plainText(from headers: [String: String], body: String) -> Parsed {
+        parse(headers: headers, wireBody: normalizeLineEndings(wireString(Data(body.utf8))))
+    }
+
+    private static func parse(headers: [String: String], wireBody: String) -> Parsed {
+        var collector = Collector()
+        walk(headers: headers, body: wireBody, section: [], into: &collector)
+        var text = collector.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if text.isEmpty, let html = collector.html {
+            text = stripHTML(html)
         }
-        if (contentType.isEmpty || contentType == "text/plain"),
-           let inferred = inferredMultipartType(from: body) {
-            headers["content-type"] = inferred
-            return parseMultipart(headers: headers, body: body)
+        return (text, collector.html, collector.attachments)
+    }
+
+    private static func walk(headers: [String: String], body: String, section: [Int], into collector: inout Collector) {
+        var contentType = headers["content-type"] ?? ""
+        let declared = mediaType(contentType)
+        if declared.isEmpty || declared == "text/plain", let inferred = inferredMultipartType(from: body) {
+            contentType = inferred
         }
-        if contentType.contains("text/html") {
-            return (stripHTML(body), body, [])
+        let type = mediaType(contentType).isEmpty ? "text/plain" : mediaType(contentType)
+
+        if type.hasPrefix("multipart/"), let boundary = boundary(from: contentType) {
+            for (offset, part) in multipartBodies(body, boundary: boundary).enumerated() {
+                let split = splitHeadersAndBody(part, trimLeading: true)
+                walk(headers: split.headers, body: split.body, section: section + [offset + 1], into: &collector)
+            }
+            return
         }
-        return (body, nil, [])
+
+        let disposition = headers["content-disposition"] ?? ""
+        let filename = parameter("filename", in: disposition) ?? parameter("name", in: contentType)
+        let encoding = headers["content-transfer-encoding"]?.trimmingCharacters(in: .whitespaces).lowercased() ?? ""
+        let isText = type == "text/plain" || type == "text/html"
+        if !isText || filename != nil || disposition.lowercased().hasPrefix("attachment") {
+            let sectionID = section.isEmpty ? "1" : section.map(String.init).joined(separator: ".")
+            let encodedSize = body.utf8.count
+            collector.attachments.append(
+                MailAttachmentMeta(
+                    id: "imap:\(sectionID)",
+                    filename: filename.map(decodeEncodedWords) ?? "attachment-\(sectionID)",
+                    mimeType: type,
+                    size: encoding == "base64" ? encodedSize * 3 / 4 : encodedSize
+                )
+            )
+            return
+        }
+
+        let decoded = decodeText(transferDecoded(body, encoding: encoding), charset: parameter("charset", in: contentType))
+        if type == "text/html" {
+            if collector.html == nil { collector.html = decoded }
+        } else if collector.text.isEmpty {
+            collector.text = decoded
+        }
+    }
+
+    private static func wireString(_ data: Data) -> String {
+        String(data: data, encoding: .isoLatin1) ?? String(decoding: data, as: UTF8.self)
+    }
+
+    private static func wireBytes(_ wire: String) -> Data {
+        Data(wire.unicodeScalars.map { UInt8(truncatingIfNeeded: $0.value) })
+    }
+
+    private static func normalizeLineEndings(_ text: String) -> String {
+        text.replacingOccurrences(of: "\r\n", with: "\n").replacingOccurrences(of: "\r", with: "\n")
+    }
+
+    private static func mediaType(_ contentType: String) -> String {
+        contentType.split(separator: ";").first.map { $0.trimmingCharacters(in: .whitespaces).lowercased() } ?? ""
+    }
+
+    private static func transferDecoded(_ wire: String, encoding: String) -> Data {
+        switch encoding {
+        case "quoted-printable":
+            return quotedPrintableDecoded(wireBytes(wire))
+        case "base64":
+            var compact = wire.filter { !$0.isWhitespace }
+            if compact.count % 4 != 0 {
+                compact += String(repeating: "=", count: 4 - compact.count % 4)
+            }
+            return Data(base64Encoded: compact, options: .ignoreUnknownCharacters) ?? wireBytes(wire)
+        default:
+            return wireBytes(wire)
+        }
+    }
+
+    static func quotedPrintableDecoded(_ bytes: Data) -> Data {
+        let input = [UInt8](bytes)
+        var output = Data(capacity: input.count)
+        var index = 0
+        func hexValue(_ byte: UInt8) -> UInt8? {
+            switch byte {
+            case 48...57: return byte - 48
+            case 65...70: return byte - 55
+            case 97...102: return byte - 87
+            default: return nil
+            }
+        }
+        while index < input.count {
+            let byte = input[index]
+            guard byte == UInt8(ascii: "=") else {
+                output.append(byte)
+                index += 1
+                continue
+            }
+            var lookahead = index + 1
+            while lookahead < input.count, input[lookahead] == UInt8(ascii: " ") || input[lookahead] == UInt8(ascii: "\t") {
+                lookahead += 1
+            }
+            if lookahead < input.count, input[lookahead] == UInt8(ascii: "\n") {
+                index = lookahead + 1
+            } else if lookahead >= input.count {
+                index = lookahead
+            } else if index + 2 < input.count, let high = hexValue(input[index + 1]), let low = hexValue(input[index + 2]) {
+                output.append(high << 4 | low)
+                index += 3
+            } else {
+                output.append(byte)
+                index += 1
+            }
+        }
+        return output
+    }
+
+    private static func decodeText(_ data: Data, charset: String?) -> String {
+        if let charset, let encoding = stringEncoding(charset), let text = String(data: data, encoding: encoding) {
+            return text
+        }
+        if let text = String(data: data, encoding: .utf8) {
+            return text
+        }
+        return String(data: data, encoding: .windowsCP1252) ?? String(decoding: data, as: UTF8.self)
+    }
+
+    private static func stringEncoding(_ charset: String) -> String.Encoding? {
+        let name = charset.trimmingCharacters(in: CharacterSet(charactersIn: " \"'")).lowercased()
+        guard !name.isEmpty else { return nil }
+        if name == "utf-8" || name == "utf8" || name == "us-ascii" { return .utf8 }
+        let cfEncoding = CFStringConvertIANACharSetNameToEncoding(name as CFString)
+        guard cfEncoding != kCFStringEncodingInvalidId else { return nil }
+        return String.Encoding(rawValue: CFStringConvertEncodingToNSStringEncoding(cfEncoding))
+    }
+
+    /// Decodes RFC 2047 words such as `=?UTF-8?B?...?=` in filenames.
+    private static func decodeEncodedWords(_ wireValue: String) -> String {
+        let value = decodeText(wireBytes(wireValue), charset: nil)
+            .replacingOccurrences(of: #"\?=\s+=\?"#, with: "?==?", options: .regularExpression)
+        guard value.contains("=?"),
+              let regex = try? NSRegularExpression(pattern: #"=\?([^?]+)\?([bBqQ])\?([^?]*)\?="#) else { return value }
+        var result = ""
+        var cursor = value.startIndex
+        for match in regex.matches(in: value, range: NSRange(value.startIndex..., in: value)) {
+            guard let whole = Range(match.range, in: value),
+                  let charsetRange = Range(match.range(at: 1), in: value),
+                  let modeRange = Range(match.range(at: 2), in: value),
+                  let textRange = Range(match.range(at: 3), in: value) else { continue }
+            let payload = String(value[textRange])
+            let bytes: Data
+            if value[modeRange].lowercased() == "b" {
+                bytes = transferDecoded(payload, encoding: "base64")
+            } else {
+                bytes = quotedPrintableDecoded(Data(payload.replacingOccurrences(of: "_", with: " ").utf8))
+            }
+            result += value[cursor..<whole.lowerBound]
+            result += decodeText(bytes, charset: String(value[charsetRange]))
+            cursor = whole.upperBound
+        }
+        result += value[cursor...]
+        return result
+    }
+
+    private static func parameter(_ name: String, in header: String) -> String? {
+        for piece in header.split(separator: ";").dropFirst() {
+            let pair = piece.split(separator: "=", maxSplits: 1)
+            guard pair.count == 2 else { continue }
+            let key = pair[0].trimmingCharacters(in: .whitespaces).lowercased()
+            if key == name || key == name + "*" {
+                let value = pair[1].trimmingCharacters(in: CharacterSet(charactersIn: " \"'"))
+                return value.isEmpty ? nil : value
+            }
+        }
+        return nil
+    }
+
+    private static func multipartBodies(_ body: String, boundary: String) -> [String] {
+        let delimiter = "--" + boundary
+        var parts: [String] = []
+        var current: [Substring] = []
+        var inside = false
+        for line in body.split(separator: "\n", omittingEmptySubsequences: false) {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if trimmed == delimiter + "--" {
+                if inside { parts.append(current.joined(separator: "\n")) }
+                return parts
+            }
+            if trimmed == delimiter {
+                if inside { parts.append(current.joined(separator: "\n")) }
+                current = []
+                inside = true
+                continue
+            }
+            if inside { current.append(line) }
+        }
+        if inside, !current.isEmpty { parts.append(current.joined(separator: "\n")) }
+        return parts
     }
 
     private static func inferredMultipartType(from body: String) -> String? {
@@ -123,52 +329,18 @@ enum MIMEParser {
         return "multipart/mixed; boundary=\(token)"
     }
 
-    private static func parseMultipart(headers: [String: String], body: String) -> (String, String?, [MailAttachmentMeta]) {
-        guard let boundary = boundary(from: headers["content-type"] ?? "") else {
-            return (body, nil, [])
+    private static func splitHeadersAndBody(_ part: String, trimLeading: Bool) -> (headers: [String: String], body: String) {
+        let normalized = trimLeading ? String(part.drop { $0 == "\n" }) : part
+        if normalized.hasPrefix("\n") {
+            return ([:], String(normalized.dropFirst()))
         }
-        let normalizedBody = body.replacingOccurrences(of: "\r\n", with: "\n").replacingOccurrences(of: "\r", with: "\n")
-        let parts = normalizedBody.components(separatedBy: "--" + boundary)
-        var text = ""
-        var html: String?
-        var attachments: [MailAttachmentMeta] = []
-        var index = 0
-        for part in parts {
-            if part.isEmpty || part.hasPrefix("--") { continue }
-            index += 1
-            let split = splitHeadersAndBody(part)
-            let ctype = split.headers["content-type"]?.lowercased() ?? ""
-            let disposition = split.headers["content-disposition"] ?? ""
-            let filename = filename(from: disposition) ?? filename(from: split.headers["content-type"] ?? "")
-            if filename != nil || disposition.lowercased().contains("attachment") {
-                attachments.append(
-                    MailAttachmentMeta(
-                        id: "imap:\(index)",
-                        filename: filename ?? "attachment-\(index)",
-                        mimeType: ctype.split(separator: ";").first.map { $0.trimmingCharacters(in: .whitespaces) } ?? "application/octet-stream",
-                        size: split.body.utf8.count
-                    )
-                )
-                continue
-            }
-            if ctype.contains("text/plain") && text.isEmpty {
-                text = split.body.trimmingCharacters(in: .whitespacesAndNewlines)
-            } else if ctype.contains("text/html") && html == nil {
-                html = split.body
-            }
-        }
-        if text.isEmpty, let html {
-            text = stripHTML(html)
-        }
-        return (text, html, attachments)
-    }
-
-    private static func splitHeadersAndBody(_ part: String) -> (headers: [String: String], body: String) {
-        let normalized = part.replacingOccurrences(of: "\r\n", with: "\n").trimmingCharacters(in: CharacterSet(charactersIn: "\n"))
         if let range = normalized.range(of: "\n\n") {
             let headerText = String(normalized[..<range.lowerBound])
             let body = String(normalized[range.upperBound...])
             return (RFC822.parseHeaders(headerText), body)
+        }
+        if normalized.range(of: #"^[A-Za-z-]+:"#, options: .regularExpression) != nil {
+            return (RFC822.parseHeaders(normalized), "")
         }
         return ([:], normalized)
     }
@@ -181,15 +353,6 @@ enum MIMEParser {
             value = String(value[..<semi])
         }
         return value.trimmingCharacters(in: CharacterSet(charactersIn: " \"'"))
-    }
-
-    private static func filename(from value: String) -> String? {
-        guard let range = value.range(of: "filename=", options: .caseInsensitive) else { return nil }
-        var name = String(value[range.upperBound...])
-        if let semi = name.firstIndex(of: ";") {
-            name = String(name[..<semi])
-        }
-        return name.trimmingCharacters(in: CharacterSet(charactersIn: " \"'"))
     }
 
     static func stripHTML(_ html: String) -> String {

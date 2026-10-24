@@ -1,39 +1,48 @@
 import AppKit
 import SwiftUI
 
-private struct SidebarWidthLocker: NSViewRepresentable {
-    let width: CGFloat
+/// Configures the sidebar split item once. Re-applying constraints on every SwiftUI update caused AppKit layout-loop crashes.
+private struct SidebarConfigurator: NSViewRepresentable {
+    let minWidth: CGFloat
+    let maxWidth: CGFloat
+
+    final class Coordinator {
+        var configured = false
+    }
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator()
+    }
 
     func makeNSView(context: Context) -> NSView {
         let view = NSView()
-        DispatchQueue.main.async {
-            lockSplitView(from: view)
-        }
+        configure(from: view, coordinator: context.coordinator, attempts: 10)
         return view
     }
 
-    func updateNSView(_ nsView: NSView, context: Context) {
-        DispatchQueue.main.async {
-            lockSplitView(from: nsView)
-        }
-    }
+    func updateNSView(_ nsView: NSView, context: Context) {}
 
-    private func lockSplitView(from view: NSView) {
-        var responder: NSResponder? = view
-        while let current = responder {
-            if let splitVC = current as? NSSplitViewController,
-               let firstItem = splitVC.splitViewItems.first {
-                firstItem.canCollapse = false
-                firstItem.minimumThickness = width
-                firstItem.maximumThickness = width
-                firstItem.holdingPriority = .required
-                configureAutoHideScrollers(in: firstItem.viewController.view)
-                break
+    private func configure(from view: NSView, coordinator: Coordinator, attempts: Int) {
+        DispatchQueue.main.async {
+            guard !coordinator.configured else { return }
+            var responder: NSResponder? = view
+            while let current = responder {
+                if let splitVC = current as? NSSplitViewController,
+                   let firstItem = splitVC.splitViewItems.first {
+                    coordinator.configured = true
+                    firstItem.canCollapse = false
+                    firstItem.minimumThickness = minWidth
+                    firstItem.maximumThickness = maxWidth
+                    if let root = view.window?.contentView {
+                        configureAutoHideScrollers(in: root)
+                    }
+                    return
+                }
+                responder = current.nextResponder
             }
-            responder = current.nextResponder
-        }
-        if let root = view.window?.contentView {
-            configureAutoHideScrollers(in: root)
+            if attempts > 0 {
+                configure(from: view, coordinator: coordinator, attempts: attempts - 1)
+            }
         }
     }
 
@@ -54,7 +63,6 @@ struct ContentView: View {
     @State private var selected: ContentSelection?
     @State private var showAddAccount = false
     @State private var showAddVault = false
-
     var body: some View {
         NavigationSplitView(columnVisibility: .constant(.all)) {
             VStack(spacing: 0) {
@@ -102,8 +110,8 @@ struct ContentView: View {
                 .frame(height: 208)
                 .listStyle(.sidebar)
             }
-            .navigationSplitViewColumnWidth(min: 255, ideal: 255, max: 255)
-            .background(SidebarWidthLocker(width: 255))
+            .navigationSplitViewColumnWidth(min: 220, ideal: 255, max: 360)
+            .background(SidebarConfigurator(minWidth: 220, maxWidth: 360))
             .toolbar(removing: .sidebarToggle)
         } detail: {
             if selected == .agents {
@@ -115,7 +123,7 @@ struct ContentView: View {
             } else if selected == .pending {
                 PendingSendsView()
             } else if case .account(let id) = selected, let account = appState.account(id: id) {
-                AccountDetailView(account: account)
+                MailboxWorkspaceView(account: account)
                     .id(account.id)
             } else {
                 VStack(spacing: 12) {
@@ -156,6 +164,7 @@ struct ContentView: View {
                 HStack(spacing: 6) {
                     Text(account.displayName.isEmpty ? account.email : account.displayName)
                         .font(.headline)
+                        .lineLimit(1)
                     if let badge = sidebarSyncBadge(account, policy: effectivePolicy) {
                         Text(badge.title)
                             .font(.system(size: 9, weight: badge.prominent ? .semibold : .medium))
@@ -171,6 +180,8 @@ struct ContentView: View {
                      : "\(account.email) · \(account.provider.title)")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
                 HStack(spacing: 5) {
                     if isSyncing {
                         ProgressView()
@@ -574,4 +585,79 @@ enum ContentSelection: Hashable {
     case settings
     case pending
     case account(UUID)
+}
+
+/// The folder column for one mailbox, followed by either the reader (message list and message) or the mailbox's settings.
+struct MailboxWorkspaceView: View {
+    enum Pane: Hashable {
+        case folder(String)
+        case settings
+    }
+
+    @EnvironmentObject private var appState: AppState
+    let account: MailAccount
+    @State private var pane: Pane?
+    @AppStorage("reader.folderColumnWidth") private var folderWidth: Double = 200
+
+    private static let folderRange: ClosedRange<Double> = 150...320
+    private static let contentMinWidth: Double = 560
+
+    var body: some View {
+        GeometryReader { geometry in
+            let available = Double(geometry.size.width) - Double(ColumnResizeHandle.hitWidth)
+            let width = max(Self.folderRange.lowerBound, min(folderWidth, available - Self.contentMinWidth))
+            HStack(spacing: 0) {
+                folderList
+                    .frame(width: width)
+                ColumnResizeHandle(width: $folderWidth, range: Self.folderRange)
+                content
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+        }
+        .onAppear { appState.refreshFolders(for: account) }
+    }
+
+    private var current: Pane {
+        pane ?? .folder(ReaderFolders.inboxName(in: appState.mailFolders(for: account)))
+    }
+
+    private var folderList: some View {
+        let folders = ReaderFolders.visible(appState.mailFolders(for: account))
+        return List(selection: Binding(get: { current }, set: { pane = $0 })) {
+            Section(account.displayName.isEmpty ? account.email : account.displayName) {
+                if folders.isEmpty {
+                    Label("Inbox", systemImage: "tray")
+                        .tag(Pane.folder("INBOX"))
+                }
+                ForEach(folders) { folder in
+                    Label(folder.title, systemImage: folder.systemImage)
+                        .lineLimit(1)
+                        .badge(showsBadge(folder) ? (folder.unseen ?? 0) : 0)
+                        .tag(Pane.folder(folder.name))
+                }
+            }
+            Section {
+                Label("Mailbox Settings", systemImage: "gearshape")
+                    .tag(Pane.settings)
+            }
+        }
+        .listStyle(.sidebar)
+    }
+
+    @ViewBuilder
+    private var content: some View {
+        switch current {
+        case .settings:
+            AccountDetailView(account: account)
+        case .folder(let name):
+            MailboxReaderView(account: account, folder: name) {
+                pane = .settings
+            }
+            .id(name)
+        }
+    }
+
+    private func showsBadge(_ folder: ReaderFolder) -> Bool {
+        folder.kind == .inbox || folder.kind == .other || folder.kind == .spam
+    }
 }

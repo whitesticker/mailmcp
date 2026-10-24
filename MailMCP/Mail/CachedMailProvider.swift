@@ -433,6 +433,7 @@ final class CachedMailProvider: MailProviding, @unchecked Sendable {
             mailboxes: boxes,
             query: request.query,
             after: request.after,
+            before: request.before,
             policy: policy
         )
         let isLazyQueryCovered = policy.lazyEnabled

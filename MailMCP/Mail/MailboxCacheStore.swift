@@ -635,6 +635,7 @@ final class MailboxCacheStore: @unchecked Sendable {
         mailboxes: [String],
         query: String,
         after: Date?,
+        before: Date? = nil,
         policy: CacheSyncPolicy
     ) -> Bool {
         if IMAPSearchQuery.looksLikeGmailRaw(query) {
@@ -662,6 +663,11 @@ final class MailboxCacheStore: @unchecked Sendable {
                 }
                 if folder.isFullySynced { continue }
                 if let after, let oldest = folder.oldestSyncedAt, after < oldest {
+                    allBoxesSynced = false
+                    break
+                }
+                // Paging past the synced window (within a day, since server date filters are day-granular) needs the server.
+                if let before, let oldest = folder.oldestSyncedAt, before <= oldest.addingTimeInterval(86_400) {
                     allBoxesSynced = false
                     break
                 }
@@ -801,6 +807,23 @@ final class MailboxCacheStore: @unchecked Sendable {
         defer { lock.unlock() }
         guard let db else { return }
         updateLabelsLocked(accountID: accountID, id: id, add: addLabels, remove: removeLabels, folder: folder, on: db)
+    }
+
+    func adjustFolderUnseen(accountID: UUID, folder: String, delta: Int) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let db else { return }
+        let sql = """
+        UPDATE folders SET unseen = MAX(unseen + ?1, 0)
+        WHERE account_id = ?2 AND name = ?3 AND unseen IS NOT NULL;
+        """
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK, let stmt else { return }
+        defer { sqlite3_finalize(stmt) }
+        sqlite3_bind_int(stmt, 1, Int32(delta))
+        bindText(stmt, index: 2, accountID.uuidString)
+        bindText(stmt, index: 3, folder)
+        _ = sqlite3_step(stmt)
     }
 
     func deleteMessage(accountID: UUID, id: String) {
@@ -1393,6 +1416,17 @@ final class MailboxCacheStore: @unchecked Sendable {
         """
         exec(schema, on: handle)
         exec("ALTER TABLE messages ADD COLUMN last_accessed_at REAL;", on: handle)
+
+        if scalarInt("PRAGMA user_version;", on: handle) < 1 {
+            // IMAP bodies cached before MIME transfer decoding was fixed are still quoted-printable/base64.
+            exec("""
+            BEGIN IMMEDIATE TRANSACTION;
+            DELETE FROM message_bodies WHERE message_id LIKE 'imap|%';
+            UPDATE messages SET has_body = 0 WHERE message_id LIKE 'imap|%';
+            PRAGMA user_version = 1;
+            COMMIT;
+            """, on: handle)
+        }
     }
 
     private func upsertSummaryLocked(

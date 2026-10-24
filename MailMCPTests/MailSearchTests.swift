@@ -536,6 +536,36 @@ final class MailSearchTests: XCTestCase {
         store.close()
     }
 
+    func testPagingPastPartiallySyncedWindowIsNotServedFromCache() throws {
+        let tempDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("MailMCPPagingEdgeTests-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let store = MailboxCacheStore(directoryURL: tempDir)
+        let account = MailAccount(provider: .imap, email: "window@example.com", syncScope: .recent)
+        let oldest = Date().addingTimeInterval(-30 * 86_400)
+        store.saveFolders([MailFolderCount(name: "INBOX", messages: 900, unseen: 0, selectable: true)], accountID: account.id)
+        store.updateFolderSyncState(
+            accountID: account.id,
+            folderName: "INBOX",
+            watermark: "w",
+            syncedCount: 500,
+            oldestSyncedAt: oldest,
+            isFullySynced: false
+        )
+        let policy = CacheSyncPolicy.default.effective(for: account)
+
+        XCTAssertTrue(store.canSatisfyFromCache(
+            accountID: account.id, mailboxes: ["INBOX"], query: "",
+            after: nil, before: oldest.addingTimeInterval(10 * 86_400), policy: policy
+        ), "Pages inside the synced window stay local")
+        XCTAssertFalse(store.canSatisfyFromCache(
+            accountID: account.id, mailboxes: ["INBOX"], query: "",
+            after: nil, before: oldest.addingTimeInterval(3_600), policy: policy
+        ), "Pages at the edge of the synced window go to the server")
+        store.close()
+    }
+
     func testScheduledSyncSkipsWhenWatermarkUnchanged() async throws {
         let tempDir = FileManager.default.temporaryDirectory
             .appendingPathComponent("MailMCPScheduledTests-\(UUID().uuidString)", isDirectory: true)
