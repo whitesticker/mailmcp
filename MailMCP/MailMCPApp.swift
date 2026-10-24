@@ -52,6 +52,7 @@ private struct SettingsCommands: Commands {
             .keyboardShortcut(",", modifiers: .command)
             .disabled(!appState.isUnlocked)
         }
+        CommandGroup(replacing: .help) {}
     }
 }
 
@@ -232,6 +233,9 @@ struct RootView: View {
                     try? await Task.sleep(nanoseconds: 500_000_000)
                     guard !Task.isCancelled, appState.isUnlocked else { return }
                     WindowMorphController.transition(toUnlocked: true, animated: true)
+                    // The split view must first lay out at full size; built mid-resize, its sidebar rows stay squeezed.
+                    try? await Task.sleep(nanoseconds: 300_000_000)
+                    guard !Task.isCancelled, appState.isUnlocked else { return }
                     withAnimation(.spring(response: 0.38, dampingFraction: 0.86)) {
                         showWorkspace = true
                     }
