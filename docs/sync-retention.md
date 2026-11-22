@@ -38,14 +38,14 @@ Each mailbox also has a background sync policy, chosen when you add the mailbox 
 - **Default:** Recent 1,000 messages, every 30 minutes. Mailboxes that were on Off before v2 were moved to this default.
 - **Windows don't trim.** When a message falls outside the recent window it stays in the cache; the window only decides what gets downloaded.
 - **Schedules** skip the download entirely when the server watermark hasn't changed. "Manual only" syncs when you press Sync now.
-- Auto-sync can pause on battery or in Low Power Mode (Settings › Cache).
+- Auto-sync can pause on battery or in Low Power Mode (Settings › Sync).
 
 ## Global limit
 
 - **Default:** 10 GB, adjustable in Settings › Cache (or no limit).
 - **Measured as** the database pages in use, which includes the search index. It drops right after deletions, even before the file on disk shrinks.
 - **Over the limit:** caching continues, and MailMCP shows a prompt. "Remind me later" hides it for 24 hours; it comes back while the cache is still over the limit.
-- **Freeing space:** you choose an amount, and MailMCP removes the least recently used mail first (last opened, or last synced if never opened) until roughly that much is freed. "Free up space…" in Settings › Cache opens the same tool at any time.
+- **Freeing space:** you choose an amount, and MailMCP removes the oldest mail first (by message date; among mail with the same date, the least recently opened goes first) until roughly that much is freed. "Free up space…" in Settings › Cache opens the same tool at any time.
 - **After freeing space,** the affected mailboxes' sync state is reset, so searches go to the server until the next sync refills their windows.
 
 ## Attachments

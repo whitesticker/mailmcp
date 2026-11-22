@@ -17,7 +17,7 @@ enum MailMCPTools {
         ),
         tool(
             "search_messages",
-            "Search messages across selected accounts, including Spam/Junk and Trash/Deleted Items. mailbox=everywhere (default) searches inbox, spam, and trash with provider-specific names. Returns a structured result: status is no_matches, partial, incomplete, unsupported, error, or ok. Use the returned message_id to open mail found in Spam or Trash. Does not mark messages read.",
+            "Search messages across selected accounts, including Spam/Junk and Trash/Deleted Items. mailbox=everywhere (default) searches inbox, spam, and trash with provider-specific names. Returns a structured result: status is no_matches, partial, incomplete, unsupported, error, or ok. Use the returned message_id to open mail found in Spam or Trash. Does not mark messages read. " + linkHint,
             [
                 "account_id": stringProp("Account UUID or email. Repeat as comma-separated values, or omit to search every connected account."),
                 "account_ids": arrayProp("Optional list of account UUIDs or emails. Combined with account_id."),
@@ -32,7 +32,7 @@ enum MailMCPTools {
         ),
         tool(
             "get_message",
-            "Fetch a single message body, headers, and attachment metadata. Pass message_id exactly as returned by search_messages so Spam/Trash IMAP mail can be opened. Does not mark the message read.",
+            "Fetch a single message body, headers, and attachment metadata. Pass message_id exactly as returned by search_messages so Spam/Trash IMAP mail can be opened. Does not mark the message read. " + linkHint,
             [
                 "account_id": stringProp("Account UUID or email."),
                 "message_id": stringProp("Location-aware id from search_messages, or a provider message id.")
@@ -41,7 +41,7 @@ enum MailMCPTools {
         ),
         tool(
             "list_threads",
-            "List conversation threads matching an optional query.",
+            "List conversation threads matching an optional query. Pass a thread id to get_thread to read the whole conversation.",
             [
                 "account_id": stringProp("Account UUID or email."),
                 "query": stringProp("Optional search query."),
@@ -127,7 +127,7 @@ enum MailMCPTools {
         ),
         tool(
             "get_thread",
-            "Read a conversation in date order. Pass a thread id from list_threads or a message id.",
+            "Read a conversation in date order. Pass a thread id from list_threads or a message id. " + linkHint,
             [
                 "account_id": stringProp("Account UUID or email."),
                 "thread_id": stringProp("Thread id or message id."),
@@ -137,7 +137,7 @@ enum MailMCPTools {
         ),
         tool(
             "inbox_digest",
-            "Unread snapshot: aging mail, top senders, and snoozed items. Read only.",
+            "Unread snapshot: aging mail, top senders, and snoozed items. Read only. " + linkHint,
             [
                 "account_id": stringProp("Account UUID or email."),
                 "limit": numberProp("How many unread items to sample (default 20).")
@@ -314,7 +314,7 @@ enum MailMCPTools {
             guard let id = string(arguments["message_id"]) else {
                 throw MailMCPError.invalidInput("message_id is required")
             }
-            return try encode(try await mail.getMessage(id: id))
+            return try encodeLinked(try await mail.getMessage(id: id))
 
         case "list_threads":
             let account = try state.resolveAccount(idOrEmail: string(arguments["account_id"]))
@@ -333,7 +333,12 @@ enum MailMCPTools {
                 throw MailMCPError.invalidInput("action must be archive, trash, markRead, markUnread, addLabel, or removeLabel")
             }
             try await mail.modify(id: id, action: action, label: string(arguments["label"]))
-            return try encode(["status": "ok", "action": actionRaw, "message_id": id])
+            var payload: [String: Any] = ["status": "ok", "action": actionRaw, "message_id": id]
+            // Archive and trash move IMAP mail, which changes its location-aware id.
+            if action != .archive && action != .trash {
+                payload["link"] = MessageLink(accountID: account.id, messageID: id).url.absoluteString
+            }
+            return try encode(payload)
 
         case "create_draft":
             let account = try state.resolveAccount(idOrEmail: string(arguments["account_id"]))
@@ -379,7 +384,7 @@ enum MailMCPTools {
             guard let threadID = string(arguments["thread_id"]) else {
                 throw MailMCPError.invalidInput("thread_id is required")
             }
-            return try encode(try await mail.getThread(id: threadID, limit: int(arguments["limit"]) ?? 20))
+            return try encodeLinked(try await mail.getThread(id: threadID, limit: int(arguments["limit"]) ?? 20))
 
         case "inbox_digest":
             let account = try state.resolveAccount(idOrEmail: string(arguments["account_id"]))
@@ -407,7 +412,7 @@ enum MailMCPTools {
                     .map { $0 },
                 note: "Snoozed messages are omitted from needs_reply. Digest does not change mail."
             )
-            return try encode(digest)
+            return try encodeLinked(digest)
 
         case "list_contacts":
             let account = try state.resolveAccount(idOrEmail: string(arguments["account_id"]))
@@ -510,7 +515,12 @@ enum MailMCPTools {
                 subject = message.subject
             }
             SnoozeStore.snooze(accountID: account.id, messageID: id, until: until, subject: subject)
-            return try encode(["status": "snoozed", "message_id": id, "until": ISO8601DateFormatter().string(from: until)])
+            return try encode([
+                "status": "snoozed",
+                "message_id": id,
+                "until": ISO8601DateFormatter().string(from: until),
+                "link": MessageLink(accountID: account.id, messageID: id).url.absoluteString
+            ])
 
         case "reply_message":
             let account = try state.resolveAccount(idOrEmail: string(arguments["account_id"]))
@@ -684,7 +694,7 @@ enum MailMCPTools {
             timeout: Double(int(arguments["timeout_seconds"]) ?? Int(MailDeadline.searchDefault))
         )
         let result = await MailSearchCoordinator.run(accounts: pairs, request: request)
-        return try encode(result)
+        return try encodeLinked(result)
     }
 
     @MainActor
@@ -766,9 +776,34 @@ enum MailMCPTools {
     }
 
     private static func encode(_ value: Any) throws -> String {
-        let data = try JSONSerialization.data(withJSONObject: value, options: [.prettyPrinted, .sortedKeys])
+        let data = try JSONSerialization.data(withJSONObject: value, options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes])
         return String(decoding: data, as: UTF8.self)
     }
+
+    /// Encodes `value` with a `link` on every message in it, so an agent can cite mail the user opens with one click.
+    static func encodeLinked<T: Encodable>(_ value: T) throws -> String {
+        let object = try JSONSerialization.jsonObject(with: JSONCoders.encoder.encode(value))
+        return try encode(addingMessageLinks(object))
+    }
+
+    /// A message is any object with `id`, `accountID`, `from` and `subject` (MailSummary, MailMessage); threads and drafts are not.
+    private static func addingMessageLinks(_ value: Any) -> Any {
+        if let array = value as? [Any] {
+            return array.map(addingMessageLinks)
+        }
+        guard var object = value as? [String: Any] else { return value }
+        for (key, child) in object {
+            object[key] = addingMessageLinks(child)
+        }
+        if object["link"] == nil, object["from"] != nil, object["subject"] != nil,
+           let id = object["id"] as? String, !id.isEmpty,
+           let accountID = (object["accountID"] as? String).flatMap(UUID.init(uuidString:)) {
+            object["link"] = MessageLink(accountID: accountID, messageID: id).url.absoluteString
+        }
+        return object
+    }
+
+    static let linkHint = "Each message includes `link`, a mailmcp:// URL that opens it in the MailMCP app. When you mention a message to the user, give its subject followed by the link in inline code so they can copy it; do not use Markdown link syntax."
 
     @MainActor
     private static func enqueueOrSend(

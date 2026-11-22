@@ -299,6 +299,9 @@ struct SyncPolicyPickers: View {
     @Binding var recentCount: Int
     @Binding var daysBack: Int
 
+    static let recentCounts = [250, 500, 1000, 2500, 5000]
+    static let dayCounts = [30, 90, 180, 365]
+
     var body: some View {
         Picker("Policy", selection: $scope) {
             ForEach(AccountSyncScope.allCases) { item in
@@ -308,18 +311,16 @@ struct SyncPolicyPickers: View {
         switch scope {
         case .recent:
             Picker("Inbox messages", selection: $recentCount) {
-                Text("250").tag(250)
-                Text("500").tag(500)
-                Text("1,000 (Default)").tag(1000)
-                Text("2,500").tag(2500)
-                Text("5,000").tag(5000)
+                ForEach(Self.recentCounts, id: \.self) { count in
+                    Text(count == MailAccount.defaultSyncRecentCount ? "\(count.formatted()) (Default)" : count.formatted())
+                        .tag(count)
+                }
             }
         case .days:
             Picker("Days", selection: $daysBack) {
-                Text("30 days").tag(30)
-                Text("90 days (Default)").tag(90)
-                Text("180 days").tag(180)
-                Text("365 days").tag(365)
+                ForEach(Self.dayCounts, id: \.self) { days in
+                    Text(days == 90 ? "\(days) days (Default)" : "\(days) days").tag(days)
+                }
             }
         case .off, .everything:
             EmptyView()

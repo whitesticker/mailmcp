@@ -14,11 +14,31 @@ enum MailBodyDocument {
         return remoteContentPattern.firstMatch(in: html, range: range) != nil
     }
 
-    static func html(for message: MailMessage, allowRemoteContent: Bool) -> String {
+    /// With `hidingQuotes`, only what the message adds is shown when its quoted history can be recognized.
+    static func html(for message: MailMessage, allowRemoteContent: Bool, hidingQuotes: Bool = false) -> String {
         if let html = message.bodyHTML, !html.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            return wrapHTML(html, allowRemoteContent: allowRemoteContent)
+            let shown = hidingQuotes ? reply(of: message) ?? html : html
+            return wrapHTML(shown, allowRemoteContent: allowRemoteContent)
         }
-        return wrapPlainText(message.body)
+        return wrapPlainText(hidingQuotes ? reply(of: message) ?? message.body : message.body)
+    }
+
+    static func hasQuotedHistory(_ message: MailMessage) -> Bool {
+        reply(of: message) != nil
+    }
+
+    private static let replyCache = NSCache<NSString, NSString>()
+
+    /// The body without its quoted history, or nil when none is recognized; cached because views ask on every update.
+    private static func reply(of message: MailMessage) -> String? {
+        let html = message.bodyHTML.flatMap { $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : $0 }
+        let key = "\(message.id)|\(html?.count ?? -1)|\(message.body.count)" as NSString
+        if let cached = replyCache.object(forKey: key) {
+            return cached.length == 0 ? nil : cached as String
+        }
+        let reply = html.map(MailQuote.reply(inHTML:)) ?? MailQuote.reply(inPlainText: message.body)
+        replyCache.setObject((reply ?? "") as NSString, forKey: key)
+        return reply
     }
 
     private static func contentSecurityPolicy(allowRemoteContent: Bool) -> String {
@@ -96,6 +116,10 @@ enum MailBodyDocument {
 struct MailHTMLView: NSViewRepresentable {
     let html: String
     let allowRemoteContent: Bool
+    /// When set, the page reports its rendered height instead of scrolling, so several bodies can stack in one
+    /// scroll view (the conversation view); vertical scrolling goes to the enclosing scroll view, sideways stays here
+    /// for content too wide to zoom out further.
+    var onContentHeight: ((CGFloat) -> Void)? = nil
 
     func makeCoordinator() -> Coordinator {
         Coordinator()
@@ -109,7 +133,9 @@ struct MailHTMLView: NSViewRepresentable {
         let webView = FittingWebView(frame: .zero, configuration: configuration)
         webView.navigationDelegate = context.coordinator
         webView.allowsBackForwardNavigationGestures = false
-        webView.allowsMagnification = true
+        webView.allowsMagnification = onContentHeight == nil
+        webView.forwardsScrolling = onContentHeight != nil
+        context.coordinator.onContentHeight = onContentHeight
         webView.onWidthChange = { [weak coordinator = context.coordinator, weak webView] in
             guard let coordinator, let webView else { return }
             coordinator.scheduleFit(webView, delayNs: 120_000_000)
@@ -118,12 +144,22 @@ struct MailHTMLView: NSViewRepresentable {
     }
 
     func updateNSView(_ webView: WKWebView, context: Context) {
+        context.coordinator.onContentHeight = onContentHeight
         context.coordinator.render(html: html, allowRemoteContent: allowRemoteContent, in: webView)
     }
 
     final class FittingWebView: WKWebView {
         var onWidthChange: (() -> Void)?
+        var forwardsScrolling = false
         private var lastWidth: CGFloat = 0
+
+        override func scrollWheel(with event: NSEvent) {
+            if forwardsScrolling, abs(event.scrollingDeltaY) >= abs(event.scrollingDeltaX) {
+                nextResponder?.scrollWheel(with: event)
+            } else {
+                super.scrollWheel(with: event)
+            }
+        }
 
         override func setFrameSize(_ newSize: NSSize) {
             super.setFrameSize(newSize)
@@ -134,6 +170,7 @@ struct MailHTMLView: NSViewRepresentable {
     }
 
     final class Coordinator: NSObject, WKNavigationDelegate {
+        var onContentHeight: ((CGFloat) -> Void)?
         private var renderedKey: Int?
         private var renderToken = 0
         private var fitTask: Task<Void, Never>?
@@ -148,7 +185,25 @@ struct MailHTMLView: NSViewRepresentable {
                 }
                 guard !Task.isCancelled, let webView else { return }
                 await Self.fit(webView)
+                if let report = self.onContentHeight, let height = await Self.contentHeight(webView) {
+                    report(height)
+                }
             }
+        }
+
+        /// Rendered height in points: the body's CSS height plus its margins, scaled by the fit-to-width zoom. The
+        /// body is measured rather than the document because the document never reports less than the current frame.
+        @MainActor
+        private static func contentHeight(_ webView: WKWebView) async -> CGFloat? {
+            let script = """
+            const body = document.body;
+            if (!body) { return 0; }
+            const style = getComputedStyle(body);
+            return body.getBoundingClientRect().height + parseFloat(style.marginTop) + parseFloat(style.marginBottom);
+            """
+            guard let height = (try? await webView.callAsyncJavaScript(script, contentWorld: .defaultClient)) as? Double,
+                  height > 0 else { return nil }
+            return CGFloat(height * webView.pageZoom).rounded(.up)
         }
 
         @MainActor

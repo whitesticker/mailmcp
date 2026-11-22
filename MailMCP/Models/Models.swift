@@ -511,6 +511,8 @@ struct MailSummary: Codable, Hashable, Sendable, Identifiable {
     var labels: [String]
     var mailbox: String?
     var mailboxKind: String?
+    /// The Message-ID header, for IMAP threading; nil where the provider has native threads.
+    var rfcMessageID: String?
 
     init(
         id: String,
@@ -525,12 +527,14 @@ struct MailSummary: Codable, Hashable, Sendable, Identifiable {
         isUnread: Bool,
         labels: [String],
         mailbox: String? = nil,
-        mailboxKind: String? = nil
+        mailboxKind: String? = nil,
+        rfcMessageID: String? = nil
     ) {
         self.id = id
         self.accountID = accountID
         self.accountEmail = accountEmail
         self.threadID = threadID
+        self.rfcMessageID = rfcMessageID
         self.from = from
         self.to = to
         self.subject = subject
@@ -568,6 +572,7 @@ struct MailMessage: Codable, Hashable, Sendable, Identifiable {
     var attachments: [MailAttachmentMeta]
     var mailbox: String? = nil
     var mailboxKind: String? = nil
+    var rfcMessageID: String? = nil
 }
 
 struct MailFolderCount: Codable, Hashable, Sendable, Identifiable {
@@ -589,6 +594,52 @@ struct MailThread: Codable, Hashable, Sendable, Identifiable {
     var date: Date?
     var messageCount: Int
     var isUnread: Bool
+}
+
+extension MailThread {
+    /// Copies of one message filed in several folders (Gmail labels over IMAP) share sender, date and subject.
+    static func copyKey(_ message: MailSummary) -> String {
+        "\(message.from)|\(message.date?.timeIntervalSince1970 ?? 0)|\(message.subject)"
+    }
+
+    /// Groups listed messages by thread id (subject when there is none), newest thread first. `knownCounts`
+    /// supplies fuller per-thread totals than the listing itself, e.g. from the cache.
+    static func grouping(
+        _ messages: [MailSummary],
+        account: MailAccount,
+        knownCounts: [String: Int] = [:]
+    ) -> [MailThread] {
+        var groups: [String: [MailSummary]] = [:]
+        var order: [String] = []
+        for message in messages {
+            let key = message.threadID ?? message.subject.lowercased()
+            if groups[key] == nil { order.append(key) }
+            groups[key, default: []].append(message)
+        }
+        return order.compactMap { key -> MailThread? in
+            guard let all = groups[key] else { return nil }
+            var seen = Set<String>()
+            let items = all.filter { seen.insert(copyKey($0)).inserted }
+            guard let newest = items.max(by: { ($0.date ?? .distantPast) < ($1.date ?? .distantPast) }) else { return nil }
+            var participants: [String] = []
+            for item in items.sorted(by: { ($0.date ?? .distantPast) < ($1.date ?? .distantPast) })
+            where !participants.contains(item.from) {
+                participants.append(item.from)
+            }
+            return MailThread(
+                id: key,
+                accountID: account.id,
+                accountEmail: account.email,
+                subject: newest.subject,
+                participants: participants,
+                snippet: newest.snippet,
+                date: newest.date,
+                messageCount: max(items.count, knownCounts[key] ?? 0),
+                isUnread: items.contains(where: \.isUnread)
+            )
+        }
+        .sorted { ($0.date ?? .distantPast) > ($1.date ?? .distantPast) }
+    }
 }
 
 struct MailDraft: Codable, Hashable, Sendable, Identifiable {
@@ -741,6 +792,33 @@ enum MailMCPError: LocalizedError {
         case .timeout(let m): return m
         case .cancelled(let m): return m
         }
+    }
+}
+
+extension MailMCPError {
+    /// SwiftNIO reports an unreachable server as "NIOConnectionError error 1". Rewrites connection failures into
+    /// something a person can act on; other errors pass through unchanged.
+    static func explainingConnection(_ error: Error, host: String, port: Int) -> Error {
+        if error is MailMCPError || error is CancellationError { return error }
+        let detail = "\(String(reflecting: type(of: error))) \(error)".lowercased()
+        let server = "\(host):\(port)"
+        if detail.contains("connection refused") {
+            return MailMCPError.network(
+                "\(server) refused the connection. Check the server name and port in this account’s settings."
+            )
+        }
+        if detail.contains("nioconnectionerror") || detail.contains("unreachable") || detail.contains("network is down")
+            || detail.contains("not connected") || detail.contains("nodename nor servname") {
+            return MailMCPError.network(
+                "Can’t reach \(server). You appear to be offline, or the server name is wrong. Check your internet connection; background sync will try again on its own."
+            )
+        }
+        if detail.contains("timed out") {
+            return MailMCPError.network(
+                "\(server) didn’t respond in time. Your connection may be slow or down; background sync will try again on its own."
+            )
+        }
+        return error
     }
 }
 

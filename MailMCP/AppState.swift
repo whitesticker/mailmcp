@@ -34,6 +34,49 @@ struct UnlockedVaultSummary: Identifiable {
     var accounts: [MailAccount]
 }
 
+/// A resolved message link: the window selects `folder` of the account, then the reader shows `message` or `error`.
+struct MessageOpenRequest: Identifiable, Equatable {
+    let id = UUID()
+    let accountID: UUID
+    let folder: String
+    let messageID: String
+    let message: MailMessage?
+    let error: String?
+}
+
+enum SettingsPane: String, CaseIterable, Identifiable {
+    case safety
+    case sync
+    case cache
+    case oauth
+    case vault
+    case mcp
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .safety: return "Safety"
+        case .sync: return "Sync"
+        case .cache: return "Cache"
+        case .oauth: return "OAuth"
+        case .vault: return "Vault"
+        case .mcp: return "MCP"
+        }
+    }
+
+    var icon: String {
+        switch self {
+        case .safety: return "lock.shield"
+        case .sync: return "arrow.triangle.2.circlepath"
+        case .cache: return "internaldrive"
+        case .oauth: return "key"
+        case .vault: return "externaldrive"
+        case .mcp: return "terminal"
+        }
+    }
+}
+
 @MainActor
 final class AppState: ObservableObject {
     static let shared = AppState()
@@ -61,6 +104,11 @@ final class AppState: ObservableObject {
     @Published var cacheLimitPromptVisible = false
     /// Set by Settings… (⌘,); the main window consumes it and selects Settings.
     @Published var pendingSettingsOpen = false
+    /// Settings page to show when `pendingSettingsOpen` is consumed; nil keeps the default.
+    @Published var pendingSettingsPane: SettingsPane?
+    /// A message link that arrived while locked or before the window could open it.
+    @Published var pendingMessageLink: MessageLink?
+    @Published var messageOpenRequest: MessageOpenRequest?
     @Published private var liveFolders: [UUID: [MailFolderCount]] = [:]
     private var folderRefreshDates: [UUID: Date] = [:]
     private var statsMemo: [UUID: AccountCacheStats] = [:]
@@ -522,6 +570,28 @@ final class AppState: ObservableObject {
         applyUnlockedState()
     }
 
+    /// Copies a mailbox, sign-in included, into another unlocked vault and leaves the original where it is. The copy
+    /// gets its own id, so the two never share cache or sync state; it starts uncached and follows the destination
+    /// vault's settings.
+    func copyAccount(_ id: UUID, toVault target: UUID) throws {
+        let source = try storeOwning(accountID: id)
+        guard let destination = stores[target], destination.isUnlocked else { throw MailMCPError.vaultLocked }
+        guard source !== destination, var copy = source.payload?.accounts.first(where: { $0.id == id }) else { return }
+        if destination.payload?.accounts.contains(where: {
+            $0.provider == copy.provider && $0.email.caseInsensitiveCompare(copy.email) == .orderedSame
+        }) == true {
+            throw MailMCPError.invalidInput("\(copy.email) is already in \(destination.payload?.name ?? "that vault").")
+        }
+        copy.id = UUID()
+        copy.createdAt = Date()
+        copy.lastError = nil
+        try destination.mutate { payload in
+            payload.accounts.append(copy)
+        }
+        applyUnlockedState()
+        statusMessage = "Copied \(copy.email) to \(destination.payload?.name ?? "the other vault")."
+    }
+
     func moveAccounts(in vaultID: UUID, fromOffsets: IndexSet, toOffset: Int) throws {
         guard let store = stores[vaultID], let current = store.payload?.accounts else {
             throw MailMCPError.vaultLocked
@@ -762,6 +832,82 @@ final class AppState: ObservableObject {
         applyUnlockedState(preserveStatus: true)
     }
 
+    /// Applies one change to every mailbox in every unlocked vault, writing each vault once.
+    func updateAllAccountsSync(_ change: (inout MailAccount) -> Void) {
+        for store in stores.values where store.payload != nil {
+            try? store.mutate { payload in
+                for index in payload.accounts.indices {
+                    change(&payload.accounts[index])
+                }
+            }
+        }
+        applyUnlockedState(preserveStatus: true)
+    }
+
+    func openSettings(_ pane: SettingsPane) {
+        pendingSettingsPane = pane
+        pendingSettingsOpen = true
+    }
+
+    // MARK: - Message links
+
+    /// Holds a `mailmcp://message` link until the unlocked window opens it. Returns false for other URLs.
+    func handleMessageURL(_ url: URL) -> Bool {
+        guard MessageLink.isMessageURL(url) else { return false }
+        guard let link = MessageLink(url: url) else {
+            errorMessage = "This MailMCP link is incomplete. It needs an account and a message id."
+            return true
+        }
+        pendingMessageLink = link
+        return true
+    }
+
+    /// Reads the linked message through the cache (fetching and writing through on a miss) and asks the window to show it.
+    func openPendingMessageLink() async {
+        guard isUnlocked, let link = pendingMessageLink else { return }
+        pendingMessageLink = nil
+        guard let account = account(id: link.accountID) else {
+            errorMessage = "This link is for a mailbox that isn’t in an unlocked vault on this Mac."
+            return
+        }
+        var message: MailMessage?
+        var failure: String?
+        do {
+            let mail = try provider(for: account)
+            message = try await MailDeadline.withTimeout(seconds: 30) {
+                try await mail.getMessage(id: link.messageID)
+            }
+        } catch {
+            failure = "This message couldn’t be found in \(account.email). \(error.localizedDescription)"
+        }
+        messageOpenRequest = MessageOpenRequest(
+            accountID: account.id,
+            folder: linkFolder(message: message, messageID: link.messageID, account: account),
+            messageID: link.messageID,
+            message: message,
+            error: failure
+        )
+    }
+
+    private func linkFolder(message: MailMessage?, messageID: String, account: MailAccount) -> String {
+        let folders = mailFolders(for: account).filter(\.selectable)
+        let inbox = folders.first { MailboxMatcher.kind(ofName: $0.name) == .inbox }?.name ?? "INBOX"
+        guard let candidate = message?.mailbox ?? MessageLocator.parse(messageID).imapFolder, !candidate.isEmpty else {
+            return inbox
+        }
+        guard !folders.isEmpty else { return candidate }
+        if let match = folders.first(where: {
+            $0.name.caseInsensitiveCompare(candidate) == .orderedSame || $0.remoteID == candidate
+        }) {
+            return match.name
+        }
+        let kind = MailboxMatcher.kind(ofName: candidate)
+        if kind != .other, let match = folders.first(where: { MailboxMatcher.kind(ofName: $0.name) == kind }) {
+            return match.name
+        }
+        return inbox
+    }
+
     // MARK: - Auto-sync scheduler
 
     private var allUnlockedAccounts: [MailAccount] {
@@ -778,6 +924,11 @@ final class AppState: ObservableObject {
 
     private func startAutoSyncScheduler() {
         guard autoSyncTask == nil else { return }
+        Task.detached(priority: .utility) {
+            MailboxCacheStore.shared.backfillPreviewsIfNeeded()
+            MailboxCacheStore.shared.refreshIMAPThreadIDsIfNeeded()
+            MailboxCacheStore.shared.dropMislabeledIMAPRowsIfNeeded()
+        }
         autoSyncTask = Task { @MainActor [weak self] in
             try? await Task.sleep(nanoseconds: 5_000_000_000)
             while !Task.isCancelled {
@@ -950,6 +1101,7 @@ final class AppState: ObservableObject {
         Task {
             await MailboxSyncCoordinator.shared.resetCooldown()
         }
+        cacheRevision &+= 1
         statusMessage = "Mailbox cache cleared."
     }
 

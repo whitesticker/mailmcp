@@ -36,12 +36,13 @@ enum MCPProtocol {
             return [
                 "protocolVersion": version,
                 "capabilities": [
-                    "tools": ["listChanged": false]
+                    "tools": ["listChanged": true]
                 ],
                 "serverInfo": [
                     "name": "mailmcp",
                     "version": "1.5.0"
-                ]
+                ],
+                "instructions": "MailMCP reads the user's mail through the running MailMCP app. Messages in tool results carry a `link` (mailmcp://message?…) that opens that email in MailMCP. Whenever you refer to a specific email in your reply, write its subject followed by the link in inline code, for example: Re: Project update `mailmcp://message?account=…&id=…`. The user copies it to open the email. Do not wrap it in Markdown link syntax; chat apps drop links with custom schemes. Copy the link exactly; never build one yourself."
             ]
         case "ping":
             return [String: Any]()
@@ -342,6 +343,16 @@ final class MCPSocketHost: @unchecked Sendable {
     private let lock = NSLock()
     private var listenFD: Int32 = -1
     private var thread: Thread?
+    private var clients: [UUID: MCPInflight] = [:]
+
+    /// Tells every connected agent to fetch the tool list again, e.g. after tools are switched on or off in the app.
+    func notifyToolsChanged() {
+        lock.lock()
+        let connected = Array(clients.values)
+        lock.unlock()
+        let notification: [String: Any] = ["jsonrpc": "2.0", "method": "notifications/tools/list_changed"]
+        connected.forEach { $0.reply(notification) }
+    }
 
     func start() {
         lock.lock()
@@ -429,6 +440,9 @@ final class MCPSocketHost: @unchecked Sendable {
             }
         }
         let inflight = MCPInflight(write: writeToClient)
+        lock.lock()
+        clients[session.id] = inflight
+        lock.unlock()
         let initialName = session.name
         Task { @MainActor in
             AppState.shared.mcpAgentDidConnect(id: session.id)
@@ -437,6 +451,9 @@ final class MCPSocketHost: @unchecked Sendable {
             }
         }
         defer {
+            lock.lock()
+            clients[session.id] = nil
+            lock.unlock()
             inflight.cancelAll()
             Darwin.close(fd)
             Task { @MainActor in

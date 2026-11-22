@@ -614,28 +614,14 @@ final class CachedMailProvider: MailProviding, @unchecked Sendable {
         if messages.isEmpty {
             return try await base.listThreads(query: query, limit: limit)
         }
-        var groups: [String: [MailSummary]] = [:]
-        for message in messages {
-            let key = message.threadID ?? message.subject.lowercased()
-            groups[key, default: []].append(message)
+        let canonical = store.canonicalThreadIDs(accountID: account.id, keys: Set(messages.compactMap(\.threadID)))
+        let linked = messages.map { message -> MailSummary in
+            var message = message
+            if let key = message.threadID, let thread = canonical[key] { message.threadID = thread }
+            return message
         }
-        return groups.map { key, items in
-            let newest = items.max { ($0.date ?? .distantPast) < ($1.date ?? .distantPast) } ?? items[0]
-            return MailThread(
-                id: key,
-                accountID: account.id,
-                accountEmail: account.email,
-                subject: newest.subject,
-                participants: Array(Set(items.map(\.from))),
-                snippet: newest.snippet,
-                date: newest.date,
-                messageCount: items.count,
-                isUnread: items.contains(where: \.isUnread)
-            )
-        }
-        .sorted { ($0.date ?? .distantPast) > ($1.date ?? .distantPast) }
-        .prefix(max(limit, 1))
-        .map { $0 }
+        let counts = store.threadMessageCounts(accountID: account.id, threadIDs: Set(linked.compactMap(\.threadID)))
+        return Array(MailThread.grouping(linked, account: account, knownCounts: counts).prefix(max(limit, 1)))
     }
 
     func getThread(id: String, limit: Int) async throws -> [MailMessage] {
@@ -657,6 +643,9 @@ final class CachedMailProvider: MailProviding, @unchecked Sendable {
         try await base.modify(id: id, action: action, label: label)
         if policy.cacheActive {
             store.applyModify(accountID: account.id, id: id, action: action, label: label)
+            if action == .trash || action == .archive, MessageLocator.parse(id).isIMAP {
+                await syncAfterMove()
+            }
         }
     }
 
@@ -687,24 +676,32 @@ final class CachedMailProvider: MailProviding, @unchecked Sendable {
         try await base.fileMessage(id: id, folder: folder, addLabels: addLabels, removeLabels: removeLabels)
         if policy.cacheActive {
             store.applyFileMessage(accountID: account.id, id: id, folder: folder, addLabels: addLabels, removeLabels: removeLabels)
+            if let folder, !folder.isEmpty, MessageLocator.parse(id).isIMAP {
+                await syncAfterMove()
+            }
         }
     }
 
     func fileMatching(query: String, folder: String, mailbox: String?, limit: Int?) async throws -> Int {
         let count = try await base.fileMatching(query: query, folder: folder, mailbox: mailbox, limit: limit)
         if policy.cacheActive, count > 0 {
-            await coordinator.resetCooldown(accountID: account.id)
-            store.invalidateLazyQueries(accountID: account.id)
-            if autoSyncAllowed {
-                await coordinator.triggerBackgroundSync(
-                    account: account,
-                    provider: base,
-                    policy: policy,
-                    store: store
-                )
-            }
+            await syncAfterMove()
         }
         return count
+    }
+
+    /// Moved IMAP mail gets new UIDs in its destination; a sync lists it there under ids that open it.
+    private func syncAfterMove() async {
+        await coordinator.resetCooldown(accountID: account.id)
+        store.invalidateLazyQueries(accountID: account.id)
+        if autoSyncAllowed {
+            await coordinator.triggerBackgroundSync(
+                account: account,
+                provider: base,
+                policy: policy,
+                store: store
+            )
+        }
     }
 
     func frequentContacts(limit: Int) async throws -> [MailContact] {

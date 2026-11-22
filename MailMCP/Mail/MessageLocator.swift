@@ -30,6 +30,13 @@ enum MessageLocator: Hashable, Sendable {
         }
     }
 
+    /// What the cache may match besides the full reference. IMAP and draft UIDs are unique only within one folder,
+    /// so falling back to them would pick up a different message that happens to share the number.
+    var cacheFallbackID: String? {
+        if case .provider(let id) = self { return id }
+        return nil
+    }
+
     var imapFolder: String? {
         if case .imap(let folder, _) = self { return folder }
         if case .draft = self { return "Drafts" }

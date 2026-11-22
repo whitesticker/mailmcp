@@ -29,7 +29,7 @@ enum MCPToolCatalog {
         MCPToolInfo(name: "list_accounts", title: "List accounts", intro: "Shows mailboxes in the active vault, or all unlocked vaults if that setting is on.", audience: .readOnly),
         MCPToolInfo(name: "probe_accounts", title: "Probe accounts", intro: "Fast connection check and Spam/Trash folder names. Does not count every folder.", audience: .readOnly),
         MCPToolInfo(name: "search_messages", title: "Search messages", intro: "Finds messages across accounts, including Spam and Trash when mailbox=everywhere.", audience: .readOnly),
-        MCPToolInfo(name: "get_message", title: "Get message", intro: "Reads one message body. Use the message_id from search; Spam and Trash mail open correctly. Does not mark read.", audience: .readOnly),
+        MCPToolInfo(name: "get_message", title: "Get message", intro: "Reads one message body. Use the message_id from search; Spam and Trash mail open correctly. Returns a link that opens it in MailMCP. Does not mark read.", audience: .readOnly),
         MCPToolInfo(name: "get_thread", title: "Get thread", intro: "Reads a conversation in date order.", audience: .readOnly),
         MCPToolInfo(name: "list_threads", title: "List threads", intro: "Groups matching messages into conversations.", audience: .readOnly),
         MCPToolInfo(name: "list_folders", title: "List folders", intro: "Lists folders. Counts are optional and slow; omit them unless needed.", audience: .readOnly),
@@ -90,8 +90,12 @@ enum ToolGateStore {
     }
 
     static func save(_ names: [String]) {
+        let changed = Set(names) != loadDisabled()
         try? FileManager.default.createDirectory(at: Paths.applicationSupport, withIntermediateDirectories: true)
         try? JSONCoders.encoder.encode(names).write(to: url, options: .atomic)
+        if changed {
+            MCPSocketHost.shared.notifyToolsChanged()
+        }
     }
 
     static func isEnabled(_ name: String) -> Bool {

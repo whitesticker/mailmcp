@@ -81,6 +81,13 @@ The socket accepts many agents, and each agent can have many tool calls in fligh
 - [ ] **Cache stays shared**, with one rule: a call that only reads does not reset another caller's cooldown or start a sync. Sync starts from the scheduler and from an explicit miss, not from every overlapping search.
 - [ ] **Order writes per account** so two agents filing or trashing the same mailbox cannot interleave a move with a read of that message. The second write sees the first write's result.
 
+## SMTP EHLO hostname
+
+SwiftMail's SMTP client sends `EHLO` with `ProcessInfo.processInfo.hostName`. Resolving that name does an mDNS lookup, so the first send triggers macOS's "Allow MailMCP to find devices on local networks" prompt. The Mac's name (often the owner's real name) also ends up in the `Received:` header of every sent message. Denying the prompt doesn't stop sending.
+
+- [ ] Send a fixed EHLO name (`localhost` or a neutral constant) instead of the host name. SwiftMail is pinned to a remote revision in `project.yml`, so either vendor a patched local copy (no upload) or fork it on GitHub (pushes code; ask first).
+- [ ] Check that Gmail and Outlook SMTP accept the fixed name, and that the Local Network prompt no longer appears on a fresh install.
+
 ## UI Polish (from the October UI review)
 
 - [ ] **Responsive Tool History dashboard:** at narrow widths "Calls by Tool" and its description wrap into single letters beside the By Tool / By Mailbox picker, and By Mailbox's fixed label widths push charts and agent stats past the window edge. Stack the header above the picker and let the side column move below the breakdown when narrow.
@@ -93,17 +100,17 @@ The socket accepts many agents, and each agent can have many tool calls in fligh
 
 `onOpenURL` only handles `mailmcp://oauth/…`. There is no way to open one message from another app, a note, or an agent reply.
 
-- [ ] **Message URL** `mailmcp://message?account=<uuid>&id=<message id>`, using the same location-aware id `search_messages` returns.
-- [ ] **Copy link** on the open message in the reader, and include the link in agent tool results when a single message is returned.
-- [ ] **Open path:** if the vault is locked, hold the URL and open it after unlock. If the body is cached, select it locally. If not, fetch it, write it through, then select it. Unknown account or id shows an error in the reader instead of failing silently.
+- [x] **Message URL** `mailmcp://message?account=<uuid>&id=<message id>`, using the same location-aware id `search_messages` returns.
+- [x] **Copy link** on the open message in the reader, and include the link in agent tool results when a single message is returned.
+- [x] **Open path:** if the vault is locked, hold the URL and open it after unlock. If the body is cached, select it locally. If not, fetch it, write it through, then select it. Unknown account or id shows an error in the reader instead of failing silently.
 
 ## Sync settings in one place
 
 Background sync (Off / Recent / Days / Everything, schedule, body download) is edited one mailbox at a time in Mailbox Settings. Settings › Cache only has the global limit, cooldown, daily cap, and "Sync all mailboxes".
 
-- [ ] **Settings › Sync:** one list of every mailbox with scope, schedule, body download, last synced, and progress. Edit a row in place. "Apply to all" sets the same scope and schedule on every mailbox.
-- [ ] **Sync now / Pause** on the row, and one "Sync all" that is the same action as today's button.
-- [ ] Leave the per-mailbox section in place, reading and writing the same fields, so either screen stays truthful.
+- [x] **Settings › Sync:** one list of every mailbox with scope, schedule, body download, last synced, and progress. Edit a row in place. "Apply to all" sets the same scope and schedule on every mailbox.
+- [x] **Sync now / Pause** on the row, and one "Sync all" that is the same action as today's button.
+- [x] Leave the per-mailbox section in place, reading and writing the same fields, so either screen stays truthful.
 
 ## Mail vault (cache across devices)
 

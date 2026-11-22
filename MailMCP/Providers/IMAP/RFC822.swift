@@ -119,7 +119,7 @@ enum MIMEParser {
         walk(headers: headers, body: wireBody, section: [], into: &collector)
         var text = collector.text.trimmingCharacters(in: .whitespacesAndNewlines)
         if text.isEmpty, let html = collector.html {
-            text = stripHTML(html)
+            text = MailText.plainText(fromHTML: html)
         }
         return (text, collector.html, collector.attachments)
     }
@@ -353,18 +353,5 @@ enum MIMEParser {
             value = String(value[..<semi])
         }
         return value.trimmingCharacters(in: CharacterSet(charactersIn: " \"'"))
-    }
-
-    static func stripHTML(_ html: String) -> String {
-        var result = html
-        if let regex = try? NSRegularExpression(pattern: "<[^>]+>", options: .caseInsensitive) {
-            result = regex.stringByReplacingMatches(in: result, options: [], range: NSRange(result.startIndex..., in: result), withTemplate: "")
-        }
-        return result
-            .replacingOccurrences(of: "&nbsp;", with: " ")
-            .replacingOccurrences(of: "&amp;", with: "&")
-            .replacingOccurrences(of: "&lt;", with: "<")
-            .replacingOccurrences(of: "&gt;", with: ">")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }

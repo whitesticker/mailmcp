@@ -65,6 +65,8 @@ struct ContentView: View {
     @State private var selected: ContentSelection?
     @State private var settingsItem: SettingsItem = .pane(.safety)
     @State private var mailboxPane: MailboxPane?
+    /// Folder to open once a change of `selected` lands; that change otherwise resets the pane to Inbox.
+    @State private var pendingPane: MailboxPane?
     @State private var pendingID: UUID?
     var body: some View {
         NavigationSplitView(columnVisibility: .constant(.all)) {
@@ -154,10 +156,34 @@ struct ContentView: View {
             if newValue != .settings {
                 settingsItem = .pane(.safety)
             }
-            mailboxPane = nil
+            mailboxPane = pendingPane
+            pendingPane = nil
         }
-        .onAppear(perform: consumeSettingsRequest)
+        .onAppear {
+            consumeSettingsRequest()
+            openPendingMessageLink()
+            showRequestedMessage()
+        }
         .onChange(of: appState.pendingSettingsOpen) { _, _ in consumeSettingsRequest() }
+        .onChange(of: appState.pendingMessageLink) { _, _ in openPendingMessageLink() }
+        .onChange(of: appState.messageOpenRequest) { _, _ in showRequestedMessage() }
+    }
+
+    private func openPendingMessageLink() {
+        guard appState.pendingMessageLink != nil else { return }
+        Task { await appState.openPendingMessageLink() }
+    }
+
+    /// Selects the linked message's mailbox and folder; that folder's reader then picks up the request.
+    private func showRequestedMessage() {
+        guard let request = appState.messageOpenRequest else { return }
+        let pane = MailboxPane.folder(request.folder)
+        if selected == .account(request.accountID) {
+            mailboxPane = pane
+        } else {
+            pendingPane = pane
+            selected = .account(request.accountID)
+        }
     }
 
     private var middleColumnTitle: String {
@@ -203,6 +229,10 @@ struct ContentView: View {
         guard appState.pendingSettingsOpen else { return }
         appState.pendingSettingsOpen = false
         selected = .settings
+        if let pane = appState.pendingSettingsPane {
+            appState.pendingSettingsPane = nil
+            settingsItem = .pane(pane)
+        }
     }
 
     private func mailboxRow(_ account: MailAccount) -> some View {
@@ -442,8 +472,7 @@ struct AccountDetailView: View {
         let stats = appState.cacheStats(for: account)
         let isSyncing = appState.isSyncingCache(for: account)
         let progressText = appState.syncProgressMessage(for: account)
-        let globalPolicy = appState.settings(for: account).cachePolicy
-        let effectivePolicy = globalPolicy.effective(for: account)
+        let effectivePolicy = appState.settings(for: account).cachePolicy.effective(for: account)
 
         Form {
             Section("Nickname") {
@@ -481,6 +510,21 @@ struct AccountDetailView: View {
                     Button("Modify account credentials…") {
                         showEditAccount = true
                     }
+                    Menu("Copy to Vault") {
+                        ForEach(otherVaults) { vault in
+                            Button(vault.name) {
+                                do {
+                                    try appState.copyAccount(account.id, toVault: vault.id)
+                                    result = "Copied to \(vault.name). The copy syncs on its own; this mailbox stays here."
+                                } catch {
+                                    result = error.localizedDescription
+                                }
+                            }
+                        }
+                    }
+                    .fixedSize()
+                    .disabled(otherVaults.isEmpty)
+                    .help(otherVaults.isEmpty ? "Unlock or create another vault to copy this mailbox into" : "Copy this mailbox and its sign-in to another unlocked vault")
                     Button("Remove account…", role: .destructive) {
                         confirmRemove = true
                     }
@@ -491,61 +535,22 @@ struct AccountDetailView: View {
             }
 
             Section("Background Sync") {
-                SyncPolicyPickers(
-                    scope: syncScopeBinding,
-                    recentCount: syncRecentCountBinding,
-                    daysBack: syncDaysBackBinding
-                )
-                if account.syncScope == .everything {
-                    Toggle("Download & index all message bodies (text/HTML)", isOn: fullSyncBodiesBinding)
-                }
-                Text(SyncPolicyPickers.explanation(for: account.syncScope))
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                if account.syncScope != .off {
-                    Picker("When to sync", selection: syncScheduleBinding) {
-                        ForEach(AccountSyncSchedule.allCases) { schedule in
-                            Text(schedule.title).tag(schedule)
-                        }
-                    }
-                    LabeledContent("Next sync") {
-                        TimelineView(.periodic(from: .now, by: 30)) { context in
-                            Text(nextSyncText(now: context.date, policy: globalPolicy))
-                                .foregroundStyle(.secondary)
-                        }
-                    }
-                }
+                SyncMailboxRow(account: account, showsIdentity: false)
                 if let cacheNotice {
                     Text(cacheNotice)
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
                 FlowLayout {
-                    if account.syncScope != .off {
-                        Button(isSyncing ? "Syncing…" : (effectivePolicy.mode == .fullSync ? "Start / resume full sync" : "Sync now")) {
-                            cacheNotice = nil
-                            Task {
-                                await appState.syncMailboxCacheNow(account: account)
-                                await MainActor.run {
-                                    cacheNotice = "Mailbox synced."
-                                }
-                            }
-                        }
-                        .disabled(isSyncing)
-                    }
-
-                    if isSyncing {
-                        Button("Pause sync") {
-                            appState.pauseMailboxSync(account: account)
-                            cacheNotice = "Sync paused. Click Start / resume to continue where it left off."
-                        }
-                    }
-
                     Button("Clear mailbox cache", role: .destructive) {
                         appState.clearMailboxCache(account: account)
                         cacheNotice = "Cleared cached messages and bodies for \(account.email)."
                     }
                     .disabled(isSyncing || (stats.envelopeCount == 0 && stats.bodyCount == 0 && stats.folderCount == 0))
+                    Button("Sync Settings for All Mailboxes…") {
+                        appState.openSettings(.sync)
+                    }
+                    .help("Settings › Sync lists every mailbox’s sync policy and schedule in one place")
                 }
                 Text("Clear mailbox cache deletes only this mailbox’s local copies. Mail stays on the server, and the next sync downloads it again.")
                     .font(.caption)
@@ -681,37 +686,12 @@ struct AccountDetailView: View {
         }
     }
 
-    private func accountSyncBinding<Value>(_ keyPath: WritableKeyPath<MailAccount, Value>) -> Binding<Value> {
-        Binding(
-            get: { account[keyPath: keyPath] },
-            set: { newValue in
-                appState.updateAccountSync(accountID: account.id) { $0[keyPath: keyPath] = newValue }
+    private var otherVaults: [UnlockedVaultSummary] {
+        appState.unlockedVaults.filter { vault in
+            !vault.accounts.contains {
+                $0.provider == account.provider && $0.email.caseInsensitiveCompare(account.email) == .orderedSame
             }
-        )
-    }
-
-    private var syncScopeBinding: Binding<AccountSyncScope> { accountSyncBinding(\.syncScope) }
-    private var syncRecentCountBinding: Binding<Int> { accountSyncBinding(\.syncRecentCount) }
-    private var syncDaysBackBinding: Binding<Int> { accountSyncBinding(\.syncDaysBack) }
-    private var syncScheduleBinding: Binding<AccountSyncSchedule> { accountSyncBinding(\.syncSchedule) }
-    private var fullSyncBodiesBinding: Binding<Bool> { accountSyncBinding(\.fullSyncBodies) }
-
-    private func nextSyncText(now: Date, policy: CacheSyncPolicy) -> String {
-        if appState.isSyncingCache(for: account) {
-            return "Syncing now…"
         }
-        guard account.syncSchedule != .manual else {
-            return "Manual — press Sync now"
-        }
-        if policy.pauseAutoSyncOnBattery, let reason = appState.autoSyncPausedReason {
-            return "Paused (\(reason))"
-        }
-        guard let next = appState.nextAutoSyncDate(for: account) else { return "—" }
-        if next <= now {
-            return "Due now"
-        }
-        let relative = RelativeDateTimeFormatter().localizedString(for: next, relativeTo: now)
-        return "\(relative) (\(next.formatted(date: .omitted, time: .shortened)))"
     }
 
     private func syncedStatusText(stats: AccountCacheStats, now: Date) -> String {

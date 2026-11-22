@@ -366,13 +366,16 @@ final class MailboxCacheStore: @unchecked Sendable {
                 to: message.to,
                 subject: message.subject,
                 date: message.date,
-                snippet: String(message.body.prefix(200)),
+                snippet: MailText.preview(body: message.body, html: message.bodyHTML, subject: message.subject),
                 isUnread: message.isUnread,
                 labels: message.labels,
                 mailbox: message.mailbox,
-                mailboxKind: message.mailboxKind
+                mailboxKind: message.mailboxKind,
+                rfcMessageID: message.rfcMessageID
             )
-            upsertSummaryLocked(summary, cc: message.cc, bcc: message.bcc, hasBody: true, now: now, on: db)
+            // Gmail and Graph list results carry the server's own snippet, which reads better than ours.
+            let keepsStoredSnippet = !MessageLocator.parse(message.id).isIMAP && !message.id.hasPrefix("draft:")
+            upsertSummaryLocked(summary, cc: message.cc, bcc: message.bcc, hasBody: true, keepsStoredSnippet: keepsStoredSnippet, now: now, on: db)
 
             let attachmentsJSON = (try? String(decoding: JSONCoders.encoder.encode(message.attachments), as: UTF8.self)) ?? "[]"
             if prepared, let stmt {
@@ -517,10 +520,10 @@ final class MailboxCacheStore: @unchecked Sendable {
             var stmt: OpaquePointer?
             guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK, let stmt else { return nil }
             defer { sqlite3_finalize(stmt) }
-            let nativeID = MessageLocator.parse(id).nativeID
+            let nativeID = MessageLocator.parse(id).cacheFallbackID
             bindText(stmt, index: 1, accountID.uuidString)
             bindText(stmt, index: 2, id)
-            bindText(stmt, index: 3, nativeID)
+            bindOptionalText(stmt, index: 3, nativeID)
 
             guard sqlite3_step(stmt) == SQLITE_ROW else { return nil }
             let messageID = columnText(stmt, 0) ?? id
@@ -706,6 +709,99 @@ final class MailboxCacheStore: @unchecked Sendable {
         }
     }
 
+    /// A thread's cached messages across folders, oldest first. Copies of one message in several folders (Gmail
+    /// labels over IMAP) appear once, preferring the copy in `preferredMailbox`, then any folder but All Mail/Trash/Spam.
+    func threadSummaries(accountID: UUID, threadID: String, preferredMailbox: String?, limit: Int = 200) -> [MailSummary] {
+        let rows: [MailSummary] = read([]) { db in
+            let sql = """
+            SELECT m.message_id, m.account_email, m.thread_id, m.from_addr, m.to_json,
+                   m.subject, m.date_ts, m.snippet, m.is_unread, m.labels_json,
+                   m.mailbox, m.mailbox_kind
+            FROM messages m
+            WHERE m.account_id = ?1 AND m.thread_id = ?2
+            ORDER BY COALESCE(m.date_ts, 0) ASC
+            LIMIT \(max(limit, 1));
+            """
+            var stmt: OpaquePointer?
+            guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK, let stmt else { return [] }
+            defer { sqlite3_finalize(stmt) }
+            bindText(stmt, index: 1, accountID.uuidString)
+            bindText(stmt, index: 2, threadID)
+            return collectSummariesLocked(stmt: stmt, accountID: accountID)
+        }
+        func rank(_ summary: MailSummary) -> Int {
+            if let preferredMailbox, summary.mailbox?.caseInsensitiveCompare(preferredMailbox) == .orderedSame { return 0 }
+            let kind = summary.mailboxKind.flatMap(MailboxKind.init(rawValue:)) ?? .other
+            return [.all, .trash, .spam].contains(kind) ? 2 : 1
+        }
+        var best: [String: MailSummary] = [:]
+        var order: [String] = []
+        for row in rows {
+            let key = MailThread.copyKey(row)
+            if let current = best[key] {
+                if rank(row) < rank(current) { best[key] = row }
+            } else {
+                best[key] = row
+                order.append(key)
+            }
+        }
+        return order.compactMap { best[$0] }
+    }
+
+    /// The cached thread of each message named by `keys` (Message-IDs), for thread ids that point mid-conversation.
+    func canonicalThreadIDs(accountID: UUID, keys: Set<String>) -> [String: String] {
+        guard !keys.isEmpty else { return [:] }
+        return read([:]) { db in
+            let ids = Array(keys)
+            let placeholders = (0..<ids.count).map { "?\($0 + 2)" }.joined(separator: ", ")
+            let sql = """
+            SELECT rfc_message_id, thread_id FROM messages
+            WHERE account_id = ?1 AND rfc_message_id IN (\(placeholders)) AND thread_id IS NOT NULL;
+            """
+            var stmt: OpaquePointer?
+            guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK, let stmt else { return [:] }
+            defer { sqlite3_finalize(stmt) }
+            bindText(stmt, index: 1, accountID.uuidString)
+            for (offset, id) in ids.enumerated() {
+                bindText(stmt, index: Int32(offset + 2), id)
+            }
+            var map: [String: String] = [:]
+            while sqlite3_step(stmt) == SQLITE_ROW {
+                guard let key = sqlite3_column_text(stmt, 0), let thread = sqlite3_column_text(stmt, 1) else { continue }
+                map[String(cString: key)] = String(cString: thread)
+            }
+            return map
+        }
+    }
+
+    /// Cached messages per thread id. Copies of one message in several folders (Gmail labels over IMAP) count once.
+    func threadMessageCounts(accountID: UUID, threadIDs: Set<String>) -> [String: Int] {
+        guard !threadIDs.isEmpty else { return [:] }
+        return read([:]) { db in
+            let ids = Array(threadIDs)
+            let placeholders = (0..<ids.count).map { "?\($0 + 2)" }.joined(separator: ", ")
+            let sql = """
+            SELECT thread_id, COUNT(DISTINCT from_addr || '|' || IFNULL(date_ts, 0) || '|' || subject)
+            FROM messages
+            WHERE account_id = ?1 AND thread_id IN (\(placeholders))
+            GROUP BY thread_id;
+            """
+            var stmt: OpaquePointer?
+            guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK, let stmt else { return [:] }
+            defer { sqlite3_finalize(stmt) }
+            bindText(stmt, index: 1, accountID.uuidString)
+            for (offset, id) in ids.enumerated() {
+                bindText(stmt, index: Int32(offset + 2), id)
+            }
+            var counts: [String: Int] = [:]
+            while sqlite3_step(stmt) == SQLITE_ROW {
+                guard let raw = sqlite3_column_text(stmt, 0) else { continue }
+                counts[String(cString: raw)] = Int(sqlite3_column_int(stmt, 1))
+            }
+            return counts
+        }
+    }
+
     func canSatisfyFromCache(
         accountID: UUID,
         mailboxes: [String],
@@ -829,7 +925,7 @@ final class MailboxCacheStore: @unchecked Sendable {
         defer { lock.unlock() }
         guard let db else { return }
 
-        let nativeID = MessageLocator.parse(id).nativeID
+        let nativeID = MessageLocator.parse(id).cacheFallbackID
         switch action {
         case .markRead, .markUnread:
             let unread = action == .markUnread ? 1 : 0
@@ -839,17 +935,19 @@ final class MailboxCacheStore: @unchecked Sendable {
                 sqlite3_bind_int(stmt, 1, Int32(unread))
                 bindText(stmt, index: 2, accountID.uuidString)
                 bindText(stmt, index: 3, id)
-                bindText(stmt, index: 4, nativeID)
+                bindOptionalText(stmt, index: 4, nativeID)
                 _ = sqlite3_step(stmt)
                 sqlite3_finalize(stmt)
             }
+        case .trash where MessageLocator.parse(id).isIMAP, .archive where MessageLocator.parse(id).isIMAP:
+            deleteMessageLocked(accountID: accountID, id: id, on: db)
         case .trash:
             let sql = "UPDATE messages SET mailbox = 'Trash', mailbox_kind = 'trash' WHERE account_id = ?1 AND (message_id = ?2 OR native_id = ?3);"
             var stmt: OpaquePointer?
             if sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK, let stmt {
                 bindText(stmt, index: 1, accountID.uuidString)
                 bindText(stmt, index: 2, id)
-                bindText(stmt, index: 3, nativeID)
+                bindOptionalText(stmt, index: 3, nativeID)
                 _ = sqlite3_step(stmt)
                 sqlite3_finalize(stmt)
             }
@@ -859,7 +957,7 @@ final class MailboxCacheStore: @unchecked Sendable {
             if sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK, let stmt {
                 bindText(stmt, index: 1, accountID.uuidString)
                 bindText(stmt, index: 2, id)
-                bindText(stmt, index: 3, nativeID)
+                bindOptionalText(stmt, index: 3, nativeID)
                 _ = sqlite3_step(stmt)
                 sqlite3_finalize(stmt)
             }
@@ -880,6 +978,11 @@ final class MailboxCacheStore: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         guard let db else { return }
+        // An IMAP move gives the message a new UID in the destination; its next sync there lists it under the right id.
+        if let folder, !folder.isEmpty, MessageLocator.parse(id).isIMAP {
+            deleteMessageLocked(accountID: accountID, id: id, on: db)
+            return
+        }
         updateLabelsLocked(accountID: accountID, id: id, add: addLabels, remove: removeLabels, folder: folder, on: db)
     }
 
@@ -904,8 +1007,11 @@ final class MailboxCacheStore: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         guard let db else { return }
+        deleteMessageLocked(accountID: accountID, id: id, on: db)
+    }
 
-        let nativeID = MessageLocator.parse(id).nativeID
+    private func deleteMessageLocked(accountID: UUID, id: String, on db: OpaquePointer) {
+        let nativeID = MessageLocator.parse(id).cacheFallbackID
         exec("BEGIN IMMEDIATE TRANSACTION;", on: db)
         let ftsDel = """
         DELETE FROM messages_fts WHERE rowid IN (
@@ -916,7 +1022,7 @@ final class MailboxCacheStore: @unchecked Sendable {
         if sqlite3_prepare_v2(db, ftsDel, -1, &stmt1, nil) == SQLITE_OK, let stmt1 {
             bindText(stmt1, index: 1, accountID.uuidString)
             bindText(stmt1, index: 2, id)
-            bindText(stmt1, index: 3, nativeID)
+            bindOptionalText(stmt1, index: 3, nativeID)
             _ = sqlite3_step(stmt1)
             sqlite3_finalize(stmt1)
         }
@@ -927,7 +1033,7 @@ final class MailboxCacheStore: @unchecked Sendable {
             if sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK, let stmt {
                 bindText(stmt, index: 1, accountID.uuidString)
                 bindText(stmt, index: 2, id)
-                bindText(stmt, index: 3, nativeID)
+                bindOptionalText(stmt, index: 3, nativeID)
                 _ = sqlite3_step(stmt)
                 sqlite3_finalize(stmt)
             }
@@ -980,7 +1086,7 @@ final class MailboxCacheStore: @unchecked Sendable {
                                FROM message_bodies b
                                WHERE b.account_id = m.account_id AND b.message_id = m.message_id), 0)
             FROM messages m
-            ORDER BY COALESCE(m.last_accessed_at, m.updated_at) ASC, COALESCE(m.date_ts, 0) ASC
+            ORDER BY COALESCE(m.date_ts, 0) ASC, COALESCE(m.last_accessed_at, m.updated_at) ASC
             LIMIT 500;
             """
             var stmt: OpaquePointer?
@@ -1347,6 +1453,8 @@ final class MailboxCacheStore: @unchecked Sendable {
         """
         exec(schema, on: handle)
         exec("ALTER TABLE messages ADD COLUMN last_accessed_at REAL;", on: handle)
+        exec("ALTER TABLE messages ADD COLUMN rfc_message_id TEXT;", on: handle)
+        exec("CREATE INDEX IF NOT EXISTS idx_messages_account_rfc ON messages (account_id, rfc_message_id);", on: handle)
 
         if scalarInt("PRAGMA user_version;", on: handle) < 1 {
             // IMAP bodies cached before MIME transfer decoding was fixed are still quoted-printable/base64.
@@ -1368,6 +1476,179 @@ final class MailboxCacheStore: @unchecked Sendable {
             try? FileManager.default.removeItem(at: attachmentsDirectoryURL)
             exec("PRAGMA user_version = 3;", on: handle)
         }
+    }
+
+    // MARK: - Preview backfill (user_version 5)
+
+    private struct PreviewBackfillRow {
+        let rowid: Int64
+        let accountID: String
+        let messageID: String
+        let subject: String
+        let snippet: String
+        let body: String
+        let html: String?
+    }
+
+    private var previewBackfillRunning = false
+    /// Bump when `MailText.preview` changes enough that stored previews should be rebuilt. Shares
+    /// `user_version` with the schema migrations in `openAndMigrate`, so new migrations must use higher numbers.
+    private static let previewBackfillVersion = 5
+
+    /// Rebuilds previews, and bodies an older HTML stripper filled with CSS, for mail cached before `MailText`.
+    /// Runs in small batches so sync and the reader interleave with it. Interrupting is safe: rows that are
+    /// already clean produce no change, so the next launch just walks them again.
+    func backfillPreviewsIfNeeded(batchSize: Int = 100) {
+        lock.lock()
+        guard let db, !previewBackfillRunning, scalarInt("PRAGMA user_version;", on: db) < Self.previewBackfillVersion else {
+            lock.unlock()
+            return
+        }
+        previewBackfillRunning = true
+        lock.unlock()
+        defer {
+            lock.lock()
+            previewBackfillRunning = false
+            lock.unlock()
+        }
+
+        var lastRowID: Int64 = 0
+        var changed = false
+        while true {
+            let batch = read([PreviewBackfillRow]()) { db in previewBackfillBatch(after: lastRowID, limit: batchSize, on: db) }
+            guard let last = batch.last else { break }
+            lastRowID = last.rowid
+            let updates = batch.compactMap(Self.previewBackfillUpdate)
+            guard !updates.isEmpty else { continue }
+            lock.lock()
+            guard let db = self.db else {
+                lock.unlock()
+                return
+            }
+            exec("BEGIN IMMEDIATE TRANSACTION;", on: db)
+            for update in updates {
+                if let body = update.body {
+                    runLocked("UPDATE message_bodies SET body_text = ?3 WHERE account_id = ?1 AND message_id = ?2;", update.row, body, on: db)
+                }
+                if let snippet = update.snippet {
+                    runLocked("UPDATE messages SET snippet = ?3 WHERE account_id = ?1 AND message_id = ?2;", update.row, snippet, on: db)
+                }
+                refreshFTSLocked(accountID: update.row.accountID, messageID: update.row.messageID, bodyText: nil, on: db)
+            }
+            exec("COMMIT;", on: db)
+            lock.unlock()
+            changed = true
+        }
+        lock.lock()
+        if let db = self.db { exec("PRAGMA user_version = \(Self.previewBackfillVersion);", on: db) }
+        lock.unlock()
+        if changed { notifyChange() }
+    }
+
+    // MARK: - IMAP thread ids (user_version 7)
+
+    private static let threadIDRefreshVersion = 7
+
+    /// IMAP thread ids used to be each message's own Message-ID and are now the conversation root from
+    /// References, linked through `rfc_message_id`. Forgetting those accounts' watermarks makes the next
+    /// scheduled sync re-list titles, which rewrites both. Waits for the preview backfill, whose version is lower, so it never skips it.
+    func refreshIMAPThreadIDsIfNeeded() {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let db else { return }
+        let version = scalarInt("PRAGMA user_version;", on: db)
+        guard version >= Self.previewBackfillVersion, version < Self.threadIDRefreshVersion else { return }
+        exec("""
+        BEGIN IMMEDIATE TRANSACTION;
+        UPDATE account_sync_state SET watermark = NULL
+        WHERE account_id IN (SELECT DISTINCT account_id FROM messages WHERE message_id LIKE 'imap|%');
+        PRAGMA user_version = \(Self.threadIDRefreshVersion);
+        COMMIT;
+        """, on: db)
+    }
+
+    private static let movedRowRepairVersion = 8
+
+    /// Moving or trashing IMAP mail used to relabel its cached row with the new folder while keeping the old
+    /// folder's UID, so opening it fetched whatever had that UID in the new folder. Those rows are dropped; the
+    /// next sync lists the mail where it is now.
+    func dropMislabeledIMAPRowsIfNeeded() {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let db else { return }
+        let version = scalarInt("PRAGMA user_version;", on: db)
+        guard version >= Self.threadIDRefreshVersion, version < Self.movedRowRepairVersion else { return }
+        var mislabeled: [(accountID: UUID, id: String)] = []
+        var stmt: OpaquePointer?
+        if sqlite3_prepare_v2(db, "SELECT account_id, message_id, mailbox FROM messages WHERE message_id LIKE 'imap|%';", -1, &stmt, nil) == SQLITE_OK, let stmt {
+            while sqlite3_step(stmt) == SQLITE_ROW {
+                guard let account = columnText(stmt, 0).flatMap(UUID.init(uuidString:)), let id = columnText(stmt, 1) else { continue }
+                if let folder = MessageLocator.parse(id).imapFolder, folder != columnText(stmt, 2) {
+                    mislabeled.append((account, id))
+                }
+            }
+            sqlite3_finalize(stmt)
+        }
+        for row in mislabeled {
+            deleteMessageLocked(accountID: row.accountID, id: row.id, on: db)
+        }
+        exec("PRAGMA user_version = \(Self.movedRowRepairVersion);", on: db)
+    }
+
+    private func previewBackfillBatch(after rowid: Int64, limit: Int, on db: OpaquePointer) -> [PreviewBackfillRow] {
+        let sql = """
+        SELECT m.rowid, m.account_id, m.message_id, m.subject, m.snippet, b.body_text, b.body_html
+        FROM messages m
+        JOIN message_bodies b ON b.account_id = m.account_id AND b.message_id = m.message_id
+        WHERE m.rowid > ?1
+        ORDER BY m.rowid
+        LIMIT ?2;
+        """
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK, let stmt else { return [] }
+        defer { sqlite3_finalize(stmt) }
+        sqlite3_bind_int64(stmt, 1, rowid)
+        sqlite3_bind_int(stmt, 2, Int32(limit))
+        var rows: [PreviewBackfillRow] = []
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            rows.append(PreviewBackfillRow(
+                rowid: sqlite3_column_int64(stmt, 0),
+                accountID: columnText(stmt, 1) ?? "",
+                messageID: columnText(stmt, 2) ?? "",
+                subject: columnText(stmt, 3) ?? "",
+                snippet: columnText(stmt, 4) ?? "",
+                body: columnText(stmt, 5) ?? "",
+                html: columnText(stmt, 6)
+            ))
+        }
+        return rows
+    }
+
+    private static func previewBackfillUpdate(_ row: PreviewBackfillRow) -> (row: PreviewBackfillRow, body: String?, snippet: String?)? {
+        var body: String?
+        if let html = row.html, !html.isEmpty,
+           row.body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || MailText.looksLikeMarkup(row.body) {
+            let text = MailText.plainText(fromHTML: html)
+            if text != row.body { body = text }
+        }
+        // Gmail and Graph snippets come from the server; replace them only where the old code overwrote them.
+        let isProviderID = !MessageLocator.parse(row.messageID).isIMAP && !row.messageID.hasPrefix("draft:")
+        var snippet: String?
+        if !isProviderID || row.snippet.isEmpty || row.snippet == String(row.body.prefix(200)) || MailText.looksLikeMarkup(row.snippet) {
+            let preview = MailText.preview(body: body ?? row.body, html: row.html, subject: row.subject)
+            if preview != row.snippet { snippet = preview }
+        }
+        return body == nil && snippet == nil ? nil : (row, body, snippet)
+    }
+
+    private func runLocked(_ sql: String, _ row: PreviewBackfillRow, _ value: String, on db: OpaquePointer) {
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK, let stmt else { return }
+        bindText(stmt, index: 1, row.accountID)
+        bindText(stmt, index: 2, row.messageID)
+        bindText(stmt, index: 3, value)
+        _ = sqlite3_step(stmt)
+        sqlite3_finalize(stmt)
     }
 
     /// Recomputes stored folder kinds after `MailboxMatcher.kind` stopped matching substrings (e.g. "Robinhood" as trash).
@@ -1407,6 +1688,7 @@ final class MailboxCacheStore: @unchecked Sendable {
         cc: [String] = [],
         bcc: [String] = [],
         hasBody: Bool = false,
+        keepsStoredSnippet: Bool = false,
         now: Double,
         on db: OpaquePointer
     ) {
@@ -1422,18 +1704,22 @@ final class MailboxCacheStore: @unchecked Sendable {
         INSERT INTO messages (
             account_id, message_id, native_id, account_email, thread_id,
             from_addr, to_json, cc_json, bcc_json, subject, date_ts,
-            snippet, is_unread, labels_json, mailbox, mailbox_kind, has_body, updated_at
+            snippet, is_unread, labels_json, mailbox, mailbox_kind, has_body, updated_at, rfc_message_id
         )
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?20)
         ON CONFLICT(account_id, message_id) DO UPDATE SET
             thread_id = COALESCE(excluded.thread_id, messages.thread_id),
+            rfc_message_id = COALESCE(excluded.rfc_message_id, messages.rfc_message_id),
             from_addr = excluded.from_addr,
             to_json = excluded.to_json,
             cc_json = CASE WHEN excluded.cc_json = '[]' THEN messages.cc_json ELSE excluded.cc_json END,
             bcc_json = CASE WHEN excluded.bcc_json = '[]' THEN messages.bcc_json ELSE excluded.bcc_json END,
             subject = excluded.subject,
             date_ts = COALESCE(excluded.date_ts, messages.date_ts),
-            snippet = CASE WHEN excluded.snippet = '' THEN messages.snippet ELSE excluded.snippet END,
+            snippet = CASE
+                WHEN excluded.snippet = '' OR (?19 = 1 AND messages.snippet != '') THEN messages.snippet
+                ELSE excluded.snippet
+            END,
             is_unread = excluded.is_unread,
             labels_json = excluded.labels_json,
             mailbox = COALESCE(excluded.mailbox, messages.mailbox),
@@ -1461,10 +1747,46 @@ final class MailboxCacheStore: @unchecked Sendable {
             bindOptionalText(stmt, index: 16, kind)
             sqlite3_bind_int(stmt, 17, hasBody ? 1 : 0)
             sqlite3_bind_double(stmt, 18, now)
+            sqlite3_bind_int(stmt, 19, keepsStoredSnippet ? 1 : 0)
+            bindOptionalText(stmt, index: 20, summary.rfcMessageID)
             _ = sqlite3_step(stmt)
             sqlite3_finalize(stmt)
         }
+        if let rfcMessageID = summary.rfcMessageID {
+            linkThreadLocked(accountID: summary.accountID.uuidString, messageID: summary.id, rfcMessageID: rfcMessageID, on: db)
+        }
         refreshFTSLocked(accountID: summary.accountID.uuidString, messageID: summary.id, bodyText: nil, on: db)
+    }
+
+    /// Some mailers reference only the parent, so a reply's thread id can name a message in the middle of the
+    /// conversation. Adopt that message's thread when it is cached, and hand this message's thread to replies
+    /// that named it.
+    private func linkThreadLocked(accountID: String, messageID: String, rfcMessageID: String, on db: OpaquePointer) {
+        let adoptParent = """
+        UPDATE messages SET thread_id = (
+            SELECT p.thread_id FROM messages p
+            WHERE p.account_id = ?1 AND p.rfc_message_id = messages.thread_id AND p.thread_id IS NOT NULL
+            LIMIT 1
+        )
+        WHERE account_id = ?1 AND message_id = ?2 AND thread_id != ?3 AND EXISTS (
+            SELECT 1 FROM messages p
+            WHERE p.account_id = ?1 AND p.rfc_message_id = messages.thread_id AND p.thread_id IS NOT NULL
+        );
+        """
+        let passToReplies = """
+        UPDATE messages SET thread_id = (SELECT t.thread_id FROM messages t WHERE t.account_id = ?1 AND t.message_id = ?2)
+        WHERE account_id = ?1 AND thread_id = ?3 AND message_id != ?2
+            AND (SELECT t.thread_id FROM messages t WHERE t.account_id = ?1 AND t.message_id = ?2) != ?3;
+        """
+        for sql in [adoptParent, passToReplies] {
+            var stmt: OpaquePointer?
+            guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK, let stmt else { continue }
+            bindText(stmt, index: 1, accountID)
+            bindText(stmt, index: 2, messageID)
+            bindText(stmt, index: 3, rfcMessageID)
+            _ = sqlite3_step(stmt)
+            sqlite3_finalize(stmt)
+        }
     }
 
     private func refreshFTSLocked(accountID: String, messageID: String, bodyText: String?, on db: OpaquePointer) {
@@ -1524,13 +1846,13 @@ final class MailboxCacheStore: @unchecked Sendable {
         folder: String?,
         on db: OpaquePointer
     ) {
-        let nativeID = MessageLocator.parse(id).nativeID
+        let nativeID = MessageLocator.parse(id).cacheFallbackID
         let selectSQL = "SELECT message_id, labels_json, mailbox, mailbox_kind FROM messages WHERE account_id = ?1 AND (message_id = ?2 OR native_id = ?3) LIMIT 1;"
         var stmt: OpaquePointer?
         guard sqlite3_prepare_v2(db, selectSQL, -1, &stmt, nil) == SQLITE_OK, let stmt else { return }
         bindText(stmt, index: 1, accountID.uuidString)
         bindText(stmt, index: 2, id)
-        bindText(stmt, index: 3, nativeID)
+        bindOptionalText(stmt, index: 3, nativeID)
         guard sqlite3_step(stmt) == SQLITE_ROW else {
             sqlite3_finalize(stmt)
             return

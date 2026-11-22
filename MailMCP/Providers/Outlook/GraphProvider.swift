@@ -316,7 +316,7 @@ final class GraphProvider: MailProviding, @unchecked Sendable {
             bcc: addresses(json["bccRecipients"]),
             subject: json["subject"] as? String ?? "(no subject)",
             date: ISO8601DateFormatter().date(from: json["receivedDateTime"] as? String ?? ""),
-            body: type == "html" ? MIMEParser.stripHTML(content) : content,
+            body: type == "html" ? MailText.plainText(fromHTML: content) : content,
             bodyHTML: type == "html" ? content : nil,
             isUnread: (json["isRead"] as? Bool) == false,
             labels: json["categories"] as? [String] ?? [],

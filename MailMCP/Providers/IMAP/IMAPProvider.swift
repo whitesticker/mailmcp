@@ -171,7 +171,8 @@ struct IMAPProvider: MailProviding {
                 let kind = MailboxMatcher.kind(ofName: folder).rawValue
                 let infos = try await server.fetchMessageInfosBulk(
                     using: MessageIdentifierSet(uids),
-                    options: [.envelope, .internalDate, .flags, .bodyStructure]
+                    options: [.envelope, .internalDate, .flags, .bodyStructure],
+                    headerFields: Self.threadingHeaders
                 )
                 guard !infos.isEmpty else { continue }
 
@@ -221,7 +222,7 @@ struct IMAPProvider: MailProviding {
                         }
                     }
                     if text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, let html {
-                        text = Self.stripHTML(html)
+                        text = MailText.plainText(fromHTML: html)
                     }
                     let attachments = skeleton.attachments.map { part in
                         MailAttachmentMeta(
@@ -238,7 +239,7 @@ struct IMAPProvider: MailProviding {
                             id: locator,
                             accountID: account.id,
                             accountEmail: account.email,
-                            threadID: info.messageId?.description,
+                            threadID: Self.threadKey(info),
                             from: info.from ?? "",
                             to: info.to,
                             cc: info.cc,
@@ -251,7 +252,8 @@ struct IMAPProvider: MailProviding {
                             labels: info.flags.map(Self.flagLabel),
                             attachments: attachments,
                             mailbox: folder,
-                            mailboxKind: kind
+                            mailboxKind: kind,
+                            rfcMessageID: info.messageId?.description
                         )
                     )
                 }
@@ -261,27 +263,7 @@ struct IMAPProvider: MailProviding {
     }
 
     func listThreads(query: String?, limit: Int) async throws -> [MailThread] {
-        let messages = try await search(query: query ?? "", limit: limit)
-        var groups: [String: [MailSummary]] = [:]
-        for message in messages {
-            let key = message.threadID ?? message.subject.lowercased()
-            groups[key, default: []].append(message)
-        }
-        return groups.map { key, items in
-            let newest = items.max { ($0.date ?? .distantPast) < ($1.date ?? .distantPast) } ?? items[0]
-            return MailThread(
-                id: key,
-                accountID: account.id,
-                accountEmail: account.email,
-                subject: newest.subject,
-                participants: Array(Set(items.map(\.from))),
-                snippet: newest.snippet,
-                date: newest.date,
-                messageCount: items.count,
-                isUnread: items.contains(where: \.isUnread)
-            )
-        }
-        .sorted { ($0.date ?? .distantPast) > ($1.date ?? .distantPast) }
+        MailThread.grouping(try await search(query: query ?? "", limit: limit), account: account)
     }
 
     func modify(id: String, action: MailModifyAction, label: String?) async throws {
@@ -332,20 +314,104 @@ struct IMAPProvider: MailProviding {
         return "sent"
     }
 
+    /// Every message whose Message-ID is the thread root or whose References/In-Reply-To mention it, newest
+    /// `limit` in date order. `id` is a thread id from `threadKey` or a message id.
     func getThread(id: String, limit: Int) async throws -> [MailMessage] {
-        let seed = try await getMessage(id: id)
-        let subject = seed.subject.replacingOccurrences(
-            of: #"^(Re|Fwd|Fw):\s*"#,
-            with: "",
-            options: [.regularExpression, .caseInsensitive]
-        )
-        let matches = try await search(query: "subject:\(subject)", limit: max(limit, 20))
-        var messages: [MailMessage] = []
-        for item in matches.prefix(limit) {
-            messages.append(try await getMessage(id: item.id))
+        try await withServer { server in
+            try? await server.listSpecialUseMailboxes()
+            let locator = MessageLocator.parse(id)
+            var seed: (uid: UID, folder: String)?
+            let root: String
+            if case .provider(let raw) = locator {
+                root = MessageID(raw)?.description ?? raw
+            } else {
+                let uid = try await selectForLocator(server, id)
+                let folder = locator.imapFolder ?? "INBOX"
+                seed = (uid, folder)
+                let info = try await server.fetchMessageInfo(for: uid, options: .envelope, headerFields: Self.threadingHeaders)
+                guard let key = info.flatMap(Self.threadKey) else {
+                    return [try await loadMessage(server: server, uid: uid, mailbox: folder)]
+                }
+                root = key
+            }
+
+            // Some mailers reference only the parent, so the conversation is followed both ways until no new ids
+            // turn up: each round looks for messages that are, or mention, an id seen so far.
+            let folders = try await threadFolders(server)
+            var seen = Set<String>()
+            var found: [(info: MessageInfo, folder: String)] = []
+            var searched = Set<String>()
+            var pending = [root]
+            for _ in 0..<4 where !pending.isEmpty {
+                let ids = Array(pending.prefix(15))
+                searched.formUnion(ids)
+                let criteria = [Self.threadCriteria(ids)]
+                for folder in folders {
+                    guard (try? await server.selectMailbox(folder)) != nil else { continue }
+                    let matches: MessageIdentifierSet<UID> = try await server.search(criteria: criteria)
+                    for info in try await Self.fetchInfos(server: server, uids: matches.toArray()) {
+                        // The same message can sit in several folders (Gmail labels); keep the first copy.
+                        let key = info.messageId?.description ?? "\(folder)|\(info.uid?.value ?? 0)"
+                        guard seen.insert(key).inserted else { continue }
+                        found.append((info, folder))
+                        let related = [info.messageId, info.inReplyTo].compactMap { $0 } + (info.references ?? [])
+                        for id in related.map(\.description) where !searched.contains(id) && !pending.contains(id) {
+                            pending.append(id)
+                        }
+                    }
+                }
+                pending.removeAll { searched.contains($0) }
+            }
+
+            let ordered = found.sorted {
+                ($0.info.date ?? $0.info.internalDate ?? .distantPast) < ($1.info.date ?? $1.info.internalDate ?? .distantPast)
+            }
+            let threadID = ordered.first.flatMap { Self.threadKey($0.info) } ?? root
+            let picked = ordered.suffix(max(limit, 1))
+            var messages: [MailMessage] = []
+            var selected: String?
+            for item in picked {
+                guard let uid = item.info.uid else { continue }
+                if selected != item.folder {
+                    try await server.selectMailbox(item.folder)
+                    selected = item.folder
+                }
+                var message = try await loadMessage(server: server, uid: uid, mailbox: item.folder)
+                message.threadID = threadID
+                messages.append(message)
+            }
+            if messages.isEmpty, let seed {
+                try await server.selectMailbox(seed.folder)
+                messages = [try await loadMessage(server: server, uid: seed.uid, mailbox: seed.folder)]
+            }
+            return messages
         }
-        if messages.isEmpty { messages = [seed] }
-        return messages.sorted { ($0.date ?? .distantPast) < ($1.date ?? .distantPast) }
+    }
+
+    /// Gmail's All Mail already holds both sent and received copies; elsewhere a conversation spans Inbox, Sent and Archive.
+    private func threadFolders(_ server: IMAPServer) async throws -> [String] {
+        if let all = try? await Self.resolveSourceMailbox(server, "all"), all.localizedCaseInsensitiveContains("all mail") {
+            return [all]
+        }
+        var names = ["INBOX", try await specialFolder(server, .sent)]
+        if let archive = try? await server.archiveFolder.name { names.append(archive) }
+        return uniqueNames(names)
+    }
+
+    /// References lets a reply name its conversation's first message, not just its parent.
+    private static let threadingHeaders = ["References"]
+
+    /// Messages whose Message-ID is one of `ids` or whose References/In-Reply-To mention one.
+    private static func threadCriteria(_ ids: [String]) -> SearchCriteria {
+        let terms = ids.map { id -> SearchCriteria in
+            .or(.header("Message-ID", id), .or(.header("References", id), .header("In-Reply-To", id)))
+        }
+        return terms.dropFirst().reduce(terms[0]) { .or($0, $1) }
+    }
+
+    /// The conversation key: the first Message-ID in References (the thread root), else the parent, else the message itself.
+    static func threadKey(_ info: MessageInfo) -> String? {
+        (info.references?.first ?? info.inReplyTo ?? info.messageId)?.description
     }
 
     func listDrafts(limit: Int) async throws -> [MailDraft] {
@@ -495,7 +561,8 @@ struct IMAPProvider: MailProviding {
     private func loadMessage(server: IMAPServer, uid: UID, mailbox: String) async throws -> MailMessage {
         guard let info = try await server.fetchMessageInfo(
             for: uid,
-            options: [.envelope, .internalDate, .flags, .bodyStructure]
+            options: [.envelope, .internalDate, .flags, .bodyStructure],
+            headerFields: Self.threadingHeaders
         ) else {
             throw MailMCPError.provider("Message \(uid.value) not found")
         }
@@ -539,7 +606,7 @@ struct IMAPProvider: MailProviding {
             }
         }
         if text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, let html {
-            text = Self.stripHTML(html)
+            text = MailText.plainText(fromHTML: html)
         }
         let unreadBefore = !info.flags.contains { if case .seen = $0 { return true }; return false }
         if unreadBefore {
@@ -549,7 +616,7 @@ struct IMAPProvider: MailProviding {
             id: locator,
             accountID: account.id,
             accountEmail: account.email,
-            threadID: info.messageId?.description,
+            threadID: Self.threadKey(info),
             from: info.from ?? "",
             to: info.to,
             cc: info.cc,
@@ -562,7 +629,8 @@ struct IMAPProvider: MailProviding {
             labels: info.flags.map(Self.flagLabel),
             attachments: attachments,
             mailbox: mailbox,
-            mailboxKind: kind
+            mailboxKind: kind,
+            rfcMessageID: info.messageId?.description
         )
     }
 
@@ -572,16 +640,17 @@ struct IMAPProvider: MailProviding {
             id: MessageLocator.imap(folder: mailbox, uid: uid).wire,
             accountID: account.id,
             accountEmail: account.email,
-            threadID: info.messageId?.description,
+            threadID: Self.threadKey(info),
             from: info.from ?? "",
             to: info.to,
             subject: info.subject ?? "(no subject)",
             date: info.date ?? info.internalDate,
-            snippet: String((info.subject ?? "").prefix(180)),
+            snippet: "",
             isUnread: !info.flags.contains(where: { if case .seen = $0 { return true }; return false }),
             labels: info.flags.map(Self.flagLabel),
             mailbox: mailbox,
-            mailboxKind: kind
+            mailboxKind: kind,
+            rfcMessageID: info.messageId?.description
         )
     }
 
@@ -725,12 +794,12 @@ struct IMAPProvider: MailProviding {
                     lastError = error
                     try? await server.disconnect()
                     if attempt == 3 || !Self.isRetryable(error) {
-                        throw error
+                        throw MailMCPError.explainingConnection(error, host: settings.imapHost, port: settings.imapPort)
                     }
                     try await Task.sleep(nanoseconds: UInt64(250_000_000 * attempt))
                 }
             }
-            throw lastError
+            throw MailMCPError.explainingConnection(lastError, host: settings.imapHost, port: settings.imapPort)
         }
         return try await withTaskCancellationHandler {
             try await task.value
@@ -747,21 +816,26 @@ struct IMAPProvider: MailProviding {
                 port: settings.smtpPort,
                 transportSecurity: Self.smtpTransport(settings)
             )
-            try await server.connect()
-            try await server.login(username: settings.username, password: settings.password)
-            try await work(server)
-            try? await server.disconnect()
+            do {
+                try await server.connect()
+                try await server.login(username: settings.username, password: settings.password)
+                try await work(server)
+                try? await server.disconnect()
+            } catch {
+                try? await server.disconnect()
+                throw MailMCPError.explainingConnection(error, host: settings.smtpHost, port: settings.smtpPort)
+            }
         }.value
     }
 
     private static func fetchLatest(server: IMAPServer, mailbox: Mailbox.Selection, limit: Int) async throws -> [MessageInfo] {
         guard let set = mailbox.latest(limit) else { return [] }
-        return try await server.fetchMessageInfosBulk(using: set, options: .slim)
+        return try await server.fetchMessageInfosBulk(using: set, options: .slim, headerFields: threadingHeaders)
     }
 
     private static func fetchLatestUnseen(server: IMAPServer, mailbox: Mailbox.Selection, limit: Int, window: Int = 250) async throws -> [MessageInfo] {
         guard let set = mailbox.latest(max(window, limit)) else { return [] }
-        let infos = try await server.fetchMessageInfosBulk(using: set, options: .slim)
+        let infos = try await server.fetchMessageInfosBulk(using: set, options: .slim, headerFields: threadingHeaders)
         return Array(
             infos.filter { info in
                 !info.flags.contains { if case .seen = $0 { return true }; return false }
@@ -771,7 +845,7 @@ struct IMAPProvider: MailProviding {
 
     private static func fetchInfos(server: IMAPServer, uids: [UID]) async throws -> [MessageInfo] {
         guard !uids.isEmpty else { return [] }
-        return try await server.fetchMessageInfosBulk(using: MessageIdentifierSet(uids), options: .slim)
+        return try await server.fetchMessageInfosBulk(using: MessageIdentifierSet(uids), options: .slim, headerFields: threadingHeaders)
     }
 
     private static func searchInfos(
@@ -961,12 +1035,6 @@ struct IMAPProvider: MailProviding {
 
     private static func address(_ raw: String) -> EmailAddress {
         EmailAddress(raw) ?? EmailAddress(address: raw)
-    }
-
-    private static func stripHTML(_ html: String) -> String {
-        html.replacingOccurrences(of: "<[^>]+>", with: " ", options: .regularExpression)
-            .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
-            .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     private static func imapTransport(_ settings: IMAPSettings) -> MailTransportSecurity {

@@ -36,13 +36,14 @@ struct CacheLimitSheet: View {
     }
 }
 
-/// Slider plus button that removes the least recently used cached mail. Used in the over-limit prompt
+/// Slider plus button that removes the oldest cached mail by date. Used in the over-limit prompt
 /// and inline in Settings › Cache. Only the local copies are removed; nothing changes on the server.
 struct FreeSpaceControls: View {
     @EnvironmentObject private var appState: AppState
     var secondaryTitle: String?
     var onSecondary: (() -> Void)?
     var onFreed: (() -> Void)?
+    var onClearAll: (() -> Void)?
 
     @State private var amountMB: Double = 0
     @State private var usedBytes: Int64 = 0
@@ -78,11 +79,15 @@ struct FreeSpaceControls: View {
                 Slider(value: $amountMB, in: range, step: Self.stepMB)
                     .disabled(!canFree)
             }
-            Text("Removes the local copies of the least recently opened mail. Nothing changes on the server, and removed mail is downloaded again the next time you or an agent need it.")
+            Text("Removes the local copies of the oldest mail first, by date. Nothing changes on the server, and removed mail is downloaded again the next time you or an agent need it.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
             HStack {
+                if let onClearAll {
+                    Button("Clear all cache", role: .destructive, action: onClearAll)
+                        .disabled(working || usedBytes == 0)
+                }
                 if working {
                     ProgressView().controlSize(.small)
                     Text("Freeing space…").foregroundStyle(.secondary)

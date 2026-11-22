@@ -22,7 +22,12 @@ struct MailMCPApp: App {
             RootView()
                 .environmentObject(appState)
                 .onOpenURL { url in
-                    _ = OAuthBrowserFlow.handle(url: url)
+                    if appState.handleMessageURL(url) {
+                        NSApp.activate(ignoringOtherApps: true)
+                        MailMCPAppDelegate.mainWindow()?.makeKeyAndOrderFront(nil)
+                    } else {
+                        _ = OAuthBrowserFlow.handle(url: url)
+                    }
                 }
         }
         .commands {
@@ -242,10 +247,14 @@ struct RootView: View {
                 }
             } else {
                 RecentCallsWindowController.shared.close()
-                withAnimation(.easeInOut(duration: 0.22)) {
-                    showWorkspace = false
+                // The workspace (at least 1100 wide) has to be gone before the window is capped at the lock size, and the
+                // resize can't run inside this view update: either way AppKit loops on constraints and aborts.
+                showWorkspace = false
+                unlockTransitionTask = Task { @MainActor in
+                    try? await Task.sleep(nanoseconds: 50_000_000)
+                    guard !Task.isCancelled, !appState.isUnlocked else { return }
+                    WindowMorphController.transition(toUnlocked: false, animated: true)
                 }
-                WindowMorphController.transition(toUnlocked: false, animated: true)
             }
         }
         .alert("Error", isPresented: Binding(

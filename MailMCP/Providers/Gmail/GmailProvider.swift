@@ -431,7 +431,7 @@ final class GmailProvider: MailProviding, @unchecked Sendable {
             attachments.append(contentsOf: nested.attachments)
         }
         if text.isEmpty, let html {
-            text = MIMEParser.stripHTML(html)
+            text = MailText.plainText(fromHTML: html)
         }
         return (text, html, attachments)
     }

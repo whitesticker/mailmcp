@@ -2,36 +2,6 @@ import AppKit
 import SwiftUI
 import UniformTypeIdentifiers
 
-enum SettingsPane: String, CaseIterable, Identifiable {
-    case safety
-    case cache
-    case oauth
-    case vault
-    case mcp
-
-    var id: String { rawValue }
-
-    var title: String {
-        switch self {
-        case .safety: return "Safety"
-        case .cache: return "Cache"
-        case .oauth: return "OAuth"
-        case .vault: return "Vault"
-        case .mcp: return "MCP"
-        }
-    }
-
-    var icon: String {
-        switch self {
-        case .safety: return "lock.shield"
-        case .cache: return "internaldrive"
-        case .oauth: return "key"
-        case .vault: return "externaldrive"
-        case .mcp: return "terminal"
-        }
-    }
-}
-
 enum SettingsItem: Hashable {
     case addAccount
     case addVault
@@ -107,7 +77,6 @@ struct SettingsView: View {
     @State private var unlockTarget: UUID?
     @State private var unlockPassphrase = ""
     @State private var cacheStats = MailboxCacheStore.shared.stats()
-    @State private var isSyncingCache = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -115,6 +84,8 @@ struct SettingsView: View {
                 switch pane {
                 case .safety:
                     safetyForm
+                case .sync:
+                    SyncSettingsView()
                 case .cache:
                     cacheForm
                 case .oauth:
@@ -204,58 +175,11 @@ struct SettingsView: View {
             }
 
             Section("Free Up Space") {
-                FreeSpaceControls()
-            }
-
-            Section("Background Sync") {
-                Toggle("Pause auto-sync on battery or Low Power Mode", isOn: pauseOnBatteryBinding)
-                FlowLayout {
-                    Button(isSyncingCache || !appState.syncingAccountIDs.isEmpty ? "Syncing…" : "Sync all mailboxes") {
-                        isSyncingCache = true
-                        Task {
-                            await appState.syncMailboxCacheNow()
-                            await MainActor.run {
-                                cacheStats = MailboxCacheStore.shared.stats()
-                                isSyncingCache = false
-                                localStatus = "Mailbox cache synced."
-                            }
-                        }
-                    }
-                    .disabled(isSyncingCache || !appState.syncingAccountIDs.isEmpty || !appState.isUnlocked
-                              || !appState.accounts.contains { $0.syncScope != .off })
-
-                    Button("Clear all cache", role: .destructive) {
-                        appState.clearMailboxCache()
-                        cacheStats = MailboxCacheStore.shared.stats()
-                        localStatus = "Mailbox cache cleared."
-                    }
-                }
-                if !appState.accounts.isEmpty {
-                    LazyVGrid(columns: [GridItem(.adaptive(minimum: 220), spacing: 10)], spacing: 10) {
-                        ForEach(appState.accounts) { account in
-                            accountCacheTile(account)
-                        }
-                    }
-                    .padding(.vertical, 4)
-                }
-                Text("Each mailbox’s policy and schedule is set in its Mailbox Settings.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-
-            Section("Server & Bandwidth") {
-                Picker("Server check cooldown", selection: cacheCooldownBinding) {
-                    Text("30 seconds").tag(30)
-                    Text("1 minute (Default)").tag(60)
-                    Text("2 minutes").tag(120)
-                    Text("5 minutes").tag(300)
-                }
-                Picker("Daily download cap (per mailbox)", selection: cacheDailyCapBinding) {
-                    Text("500 MB / day").tag(500)
-                    Text("1,000 MB / day").tag(1000)
-                    Text("1,500 MB / day (Default — under Gmail’s 2.5 GB limit)").tag(1500)
-                    Text("2,000 MB / day").tag(2000)
-                }
+                FreeSpaceControls(onClearAll: {
+                    appState.clearMailboxCache()
+                    cacheStats = MailboxCacheStore.shared.stats()
+                    localStatus = "Mailbox cache cleared."
+                })
             }
         }
         .formStyle(.grouped)
@@ -265,47 +189,6 @@ struct SettingsView: View {
         .onChange(of: appState.cacheRevision) { _, _ in
             cacheStats = MailboxCacheStore.shared.stats()
         }
-    }
-
-    private func accountCacheTile(_ account: MailAccount) -> some View {
-        let accStats = appState.cacheStats(for: account)
-        let syncing = appState.isSyncingCache(for: account)
-        return VStack(alignment: .leading, spacing: 4) {
-            HStack(spacing: 6) {
-                if syncing {
-                    ProgressView().controlSize(.mini)
-                } else {
-                    Circle()
-                        .fill((accStats.envelopeCount > 0 || accStats.lastSyncedAt != nil) ? Color.green : Color.orange)
-                        .frame(width: 7, height: 7)
-                }
-                Text(account.displayName.isEmpty ? account.email : account.displayName)
-                    .font(.subheadline.weight(.medium))
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-                Spacer(minLength: 4)
-                if account.syncScope != .off {
-                    Button(syncing ? "Syncing…" : "Sync") {
-                        Task { await appState.syncMailboxCacheNow(account: account) }
-                    }
-                    .controlSize(.small)
-                    .disabled(syncing)
-                }
-            }
-            Text(accountSyncSummary(account))
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .lineLimit(1)
-            Text("\(accStats.envelopeCount.formatted()) headers · \(accStats.bodyCount.formatted()) bodies")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-            Text(accStats.lastSyncedAt.map { "Synced \($0.formatted(date: .abbreviated, time: .shortened))" } ?? "Not synced yet")
-                .font(.caption2)
-                .foregroundStyle(.tertiary)
-        }
-        .padding(10)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
     }
 
     private var oauthForm: some View {
@@ -564,40 +447,6 @@ struct SettingsView: View {
         Binding(
             get: { appState.settings.cachePolicy.cacheLimitMB },
             set: { value in try? appState.updateSettings { $0.cachePolicy.cacheLimitMB = value } }
-        )
-    }
-
-    private var pauseOnBatteryBinding: Binding<Bool> {
-        Binding(
-            get: { appState.settings.cachePolicy.pauseAutoSyncOnBattery },
-            set: { value in try? appState.updateSettings { $0.cachePolicy.pauseAutoSyncOnBattery = value } }
-        )
-    }
-
-    private func accountSyncSummary(_ account: MailAccount) -> String {
-        switch account.syncScope {
-        case .off:
-            return "Off (lazy sync only)"
-        case .recent:
-            return "Recent \(account.syncRecentCount.formatted()) Inbox messages · \(account.syncSchedule.title)"
-        case .days:
-            return "Recent \(account.syncDaysBack) days of Inbox · \(account.syncSchedule.title)"
-        case .everything:
-            return "Background sync: everything · \(account.syncSchedule.title)"
-        }
-    }
-
-    private var cacheCooldownBinding: Binding<Int> {
-        Binding(
-            get: { appState.settings.cachePolicy.cooldownSeconds },
-            set: { value in try? appState.updateSettings { $0.cachePolicy.cooldownSeconds = value } }
-        )
-    }
-
-    private var cacheDailyCapBinding: Binding<Int> {
-        Binding(
-            get: { appState.settings.cachePolicy.dailyBandwidthCapMB },
-            set: { value in try? appState.updateSettings { $0.cachePolicy.dailyBandwidthCapMB = value } }
         )
     }
 

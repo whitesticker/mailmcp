@@ -614,7 +614,7 @@ final class MailSearchTests: XCTestCase {
         store.close()
     }
 
-    func testFreeSpaceRemovesLeastRecentlyUsedFirstAndResetsCoverage() throws {
+    func testFreeSpaceRemovesOldestMailFirstAndResetsCoverage() throws {
         let tempDir = FileManager.default.temporaryDirectory
             .appendingPathComponent("MailMCPFreeSpaceTests-\(UUID().uuidString)", isDirectory: true)
         defer { try? FileManager.default.removeItem(at: tempDir) }
@@ -622,17 +622,18 @@ final class MailSearchTests: XCTestCase {
         let store = MailboxCacheStore(directoryURL: tempDir)
         let account = MailAccount(provider: .imap, email: "free@example.com")
         let bigBody = String(repeating: "lorem ipsum dolor ", count: 2_000)
+        let firstDate = MailSearchQuery.parseDate("2026-01-01")!
 
         for index in 0..<40 {
             let summary = makeSummary("\(index)", account: account, subject: "Message \(index)")
             store.saveMessage(MailMessage(
                 id: summary.id, accountID: account.id, accountEmail: account.email, threadID: nil,
                 from: summary.from, to: summary.to, cc: [], bcc: [], subject: summary.subject,
-                date: summary.date, body: bigBody, bodyHTML: nil, isUnread: false, labels: [],
-                attachments: [], mailbox: "INBOX", mailboxKind: "inbox"
+                date: firstDate.addingTimeInterval(Double(index) * 86_400), body: bigBody, bodyHTML: nil,
+                isUnread: false, labels: [], attachments: [], mailbox: "INBOX", mailboxKind: "inbox"
             ))
         }
-        // Opening message 0 makes it the most recently used.
+        // Opening the oldest message must not protect it.
         XCTAssertNotNil(store.getMessage(accountID: account.id, id: "0"))
         store.updateFolderSyncState(
             accountID: account.id, folderName: "INBOX", watermark: "w",
@@ -650,7 +651,8 @@ final class MailSearchTests: XCTestCase {
         XCTAssertGreaterThan(result.bytesFreed, 0)
         XCTAssertLessThan(store.usedBytes(), before)
         XCTAssertEqual(result.accountIDs, [account.id])
-        XCTAssertNotNil(store.getMessage(accountID: account.id, id: "0"), "Most recently opened mail goes last")
+        XCTAssertNil(store.getMessage(accountID: account.id, id: "0"), "Oldest mail goes first, even if recently opened")
+        XCTAssertNotNil(store.getMessage(accountID: account.id, id: "39"), "Newest mail is kept")
         XCTAssertFalse(store.hasLazyQueryCached(accountID: account.id, request: spec), "Query cache is invalidated")
         XCTAssertFalse(
             store.cachedFolders(accountID: account.id).contains { $0.isFullySynced },
