@@ -40,7 +40,7 @@ enum MCPProtocol {
                 ],
                 "serverInfo": [
                     "name": "mailmcp",
-                    "version": "1.5.0"
+                    "version": "1.6.0"
                 ],
                 "instructions": "MailMCP reads the user's mail through the running MailMCP app. Messages in tool results carry a `link` (mailmcp://message?…) that opens that email in MailMCP. Whenever you refer to a specific email in your reply, write its subject followed by the link in inline code, for example: Re: Project update `mailmcp://message?account=…&id=…`. The user copies it to open the email. Do not wrap it in Markdown link syntax; chat apps drop links with custom schemes. Copy the link exactly; never build one yourself."
             ]
